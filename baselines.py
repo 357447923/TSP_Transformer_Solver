@@ -236,8 +236,10 @@ class RolloutBaseline(Baseline):
     def _reload_model(self, model):
         # model = copy.deepcopy(self.model)
         # 我替换成以下代码, 源代码的reload应该是有问题的
-        model.replace(copy.deepcopy(self.model))
-        print('reloaded')
+        model.load_state_dict(copy.deepcopy(self.model.state_dict()))
+
+
+
     def wrap_dataset(self, dataset):
         print("Evaluating baseline on dataset...")
         # Need to convert baseline to 2D to prevent converting to double, see

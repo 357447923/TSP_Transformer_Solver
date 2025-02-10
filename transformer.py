@@ -1,3 +1,6 @@
+import copy
+import heapq
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -359,10 +362,10 @@ class StateTSP(NamedTuple):
         add = mat.__getd__(ind, self.prev_a, prev_a, self.lengths).unsqueeze(1)
         bdd = torch.randn(prev_a.size(0), 1, device=device) * bdd
         bdd = bdd.repeat(1, 2)
-        bdd[:, 1] = add.squeeze() * 5
+        bdd[:, 1] = add.squeeze() * 5 #UB
         bdd = torch.min(bdd, dim=1)[0]
         bdd = bdd[:, None].repeat(1, 2)
-        bdd[:, 1] = add.squeeze() * -0.9
+        bdd[:, 1] = add.squeeze() * -0.9 #LB
         bdd = torch.max(bdd, dim=1)[0]
         lengths = self.lengths + add + bdd[:, None]
 
@@ -416,13 +419,16 @@ class AttentionModel(nn.Module):
                  checkpoint_encoder=False,
                  shrink_size=None,
                  input_size=4,
-                 max_t=12):
+                 max_t=12,
+                 beam_width=2):
         
         super(AttentionModel, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.n_encode_layers = n_encode_layers
         self.decode_type = None
+        # self.test_decode_type = "greedy" # TODO 不需要的时候记得删
+        self.beam_width = beam_width
         self.temp = 1.0
         self.tanh_clipping = tanh_clipping
         self.mask_inner = mask_inner
@@ -510,6 +516,76 @@ class AttentionModel(nn.Module):
             logit_key_fixed.contiguous()
         )
         return AttentionModelFixed(embeddings, fixed_context, *fixed_attention_node_data)
+
+    def _sampling(self, input, fixed, mat, state):
+        outputs = []
+        sequences = []
+
+        while not (state.all_finished()):
+            # 获取20个节点的选择概率，以及掩码（visited）
+            log_p, mask = self._get_log_p(fixed, state, mat, input)  # self-attention feed_back mask
+
+            # Select the indices of the next nodes in the sequences, result (batch_size) long
+            selected = self._select_node(log_p.exp()[:, 0, :], mask[:, 0, :])  # Squeeze out steps dimension
+            # 一次性选择为每个(1, 20)的tensor选择出一个节点, 并且update后，mask中对应的该节点会为True
+            state = state.update(selected, mat, input)  # state.lengths在此处进行修改
+
+            # Collect output of step
+            outputs.append(log_p[:, 0, :])
+            sequences.append(selected)  # TODO 保存sequence结果
+        return torch.stack(outputs, 1), torch.stack(sequences, 1), state
+
+    # def check(self, a, b):
+    #         for i in range(len(b)):
+    #             if b[i][0].item() != a["nodes"][i].item():
+    #                 return True
+
+    def _beam_search(self, input, fixed, mat, state, beam_width = 2):
+        class BeamState:
+            def __init__(self, init_state, init_seq, init_outputs):
+                self.state = init_state
+                self.sequences = init_seq
+                self.outputs = init_outputs
+        beam_states = [(BeamState(state, [], []), 0.0)] # (BeamState, score 概率和) 用于剪枝
+        # a = {'probs': [], 'nodes': []}
+        while not beam_states[0][0].state.all_finished():
+            new_beam_states = []
+            for i in range(len(beam_states)):
+                    beam_state = beam_states[i][0]
+
+                    log_p, mask = self._get_log_p(fixed, beam_state.state, mat, input)
+                    topk_probs, topk_nodes = torch.topk(log_p[:, 0, :], beam_width)
+                    # if i == 0:
+                    #     a["probs"].append(topk_probs[0][0])
+                    #     a["nodes"].append(topk_nodes[0][0])
+                    for j in range(beam_width):
+                        sequences = beam_state.sequences  + [topk_nodes[:, j]]
+                        outputs = beam_state.outputs + [log_p[:, 0, :]]
+                        init_state = beam_state.state.update(topk_nodes[:, j], mat, input)
+                        probs = topk_probs[:,  j]
+                        if torch.isinf(probs).all():
+                            break
+                        msk = ~torch.isinf(probs)
+                        new_beam_states.append((BeamState(init_state, sequences, outputs),
+                                            beam_states[i][1] + torch.mean(probs[msk]).item()))
+
+            # 剪枝，取最大的几个
+            new_beam_states = heapq.nlargest(beam_width, new_beam_states, key=lambda x: x[1])
+            beam_states = new_beam_states
+
+        # costs = torch.zeros((1, len(beam_states)))
+        # for i in range(len(beam_states)):
+        #     sequences = torch.stack(beam_states[i][0].sequences, 1)
+        #     cost, _ = get_costs(input, sequences, beam_states[i][0].state, mat)
+        #     costs[0][i] = torch.mean(cost)
+        #
+        # _, idx = torch.sort(costs)
+        # idx = idx[0][0].item()
+
+        return (torch.stack(beam_states[0][0].outputs, 1),
+                torch.stack(beam_states[0][0].sequences, 1),
+                beam_states[0][0].state)
+
     # 解码器相关函数
     def _inner(self, input, embeddings, mat):
         """
@@ -519,19 +595,16 @@ class AttentionModel(nn.Module):
         :output output: p0, ..., pc
         :output sequences: 节点访问选择顺序
         """
-        outputs = []
-        sequences = []
-        tmp = 0
         state = StateTSP.initialize(input)
         state = state.addmask() # mask用于记录是否已经访问
 
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
-
         batch_size = state.ids.size(0)
 
         # Perform decoding steps 执行解码步骤
         fixed = self._precompute(embeddings)
         # 论文中讲的多次解码，就是通过这个while循环中实现的
+        """
         while not (state.all_finished()): # 访问完20个节点则while结束，这个20是由opt.graph_size控制
             # 获取20个节点的选择概率，以及掩码（visited）
             log_p, mask = self._get_log_p(fixed, state, mat, input)     # self-attention feed_back mask
@@ -548,6 +621,19 @@ class AttentionModel(nn.Module):
         # Collected lists, return Tensor
         # TODO 描述数据，打印出sequences，然后描述数据变化。 把程序执行顺序记下来
         return torch.stack(outputs, 1), torch.stack(sequences, 1), state
+        """
+        if self.decode_type == "greedy":
+            return self._beam_search(input, fixed, mat, state, self.beam_width)
+        elif self.decode_type == "sampling":
+            # _log_p1, pi1, state2 = self._beam_search(input, fixed, mat, state, self.beam_width)
+            # cost2, _ = get_costs(input, pi1, state2, mat)
+            # _log_p, pi, state1 =
+            # cost1, _ = get_costs(input, pi, state1, mat)
+            # print("greedy mean cost: {}, beam search mean cost: {}".format(torch.mean(cost1), torch.mean(cost2)))
+            return self._sampling(input, fixed, mat, state)
+
+        assert False, "Unknown decode type"
+
     def _precompute(self, embeddings, num_steps=1):
 
         # The fixed context projection of the graph embedding is calculated only once for efficiency 为提高效率，graph embedding的fixed context投影仅计算一次。
@@ -630,10 +716,15 @@ class AttentionModel(nn.Module):
             logits[mask] = -math.inf
 
         return logits, glimpse.squeeze(-2)
+
     def _select_node(self, probs, mask):
 
         assert (probs == probs).all(), "Probs should not contain any nans"
-
+        # if self.test_decode_type == "greedy": # TODO 不需要的时候记得删
+        #     _, selected = probs.max(1)
+        #     assert not mask.gather(1, selected.unsqueeze(
+        #         -1)).data.any(), "Decode greedy: infeasible action has maximum probability"
+        #     return selected
         if self.decode_type == "greedy":
             _, selected = probs.max(1)
             assert not mask.gather(1, selected.unsqueeze(

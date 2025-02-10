@@ -38,8 +38,8 @@ class DistanceMatrix:
             self.m3 = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
             self.m4 = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
             self.var = torch.full((ci.n_cities * ci.n_cities, 1), 0.00, device = device).view(-1)
-            #self.var = torch.rand(ci.n_cities * ci.n_cities, device = device) * 0.06
-            #self.var = torch.randn(ci.n_cities * ci.n_cities, device = device) * 0.05 + 0.03
+            # self.var = torch.rand(ci.n_cities * ci.n_cities, device = device) * 0.06
+            # self.var = torch.randn(ci.n_cities * ci.n_cities, device = device) * 0.05 + 0.03
             if (load_dir is not None):
                 temp = np.loadtxt(load_dir, delimiter=',', skiprows=0)
                 x = np.arange(max_time_step + 1)
@@ -368,7 +368,7 @@ def run(opts):
         print('  [*] Loading data from {}'.format(load_path))
         load_data = torch_load_cpu(load_path)
     ci = Cities()
-    mat = DistanceMatrix(ci, load_dir='./m1/data.csv', max_time_step = 12)
+    mat = DistanceMatrix(ci, load_dir='./data.csv', max_time_step = 12)
     #np.savetxt('var12.txt', mat.var.cpu().numpy(), fmt='%.6f')
     np.savetxt('mat.txt', mat.mat.cpu().numpy(), fmt='%.6f')
     np.savetxt('m2.txt', mat.m2.cpu().numpy(), fmt='%.6f')
@@ -387,7 +387,8 @@ def run(opts):
         checkpoint_encoder=opts.checkpoint_encoder,
         shrink_size=opts.shrink_size,
         input_size=opts.graph_size+1,
-        max_t=12
+        max_t=12,
+        beam_width=opts.beam_width
     ).to(opts.device)
 
 
@@ -435,7 +436,7 @@ def run(opts):
     lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: opts.lr_decay ** epoch)
     # Start the actual training loop
     #val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, distribution=opts.data_distribution)
-    val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, filename='data_nodes/node_19.txt', distribution=opts.data_distribution)
+    val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, filename='../data_nodes/node_19.txt', distribution=opts.data_distribution)
     _,ind = torch.max(val_dataset.data, dim=2)
     #np.savetxt('valid_data.txt', ind.numpy(), fmt='%d')
     if opts.resume:

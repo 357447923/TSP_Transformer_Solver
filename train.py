@@ -396,7 +396,8 @@ def run(opts):
         checkpoint_encoder=opts.checkpoint_encoder, # 编码器检查点
         shrink_size=opts.shrink_size,   # 放缩大小
         input_size=opts.graph_size+1,   # 输入大小
-        max_t=12    # 最大时间步长
+        max_t=12,    # 最大时间步长
+        beam_width=opts.beam_width
     ).to(opts.device)
 
     # Overwrite model parameters by parameters to load
