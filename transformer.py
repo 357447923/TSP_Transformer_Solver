@@ -535,11 +535,6 @@ class AttentionModel(nn.Module):
             sequences.append(selected)  # TODO 保存sequence结果
         return torch.stack(outputs, 1), torch.stack(sequences, 1), state
 
-    # def check(self, a, b):
-    #         for i in range(len(b)):
-    #             if b[i][0].item() != a["nodes"][i].item():
-    #                 return True
-
     def _beam_search(self, input, fixed, mat, state, beam_width = 2):
         class BeamState:
             def __init__(self, init_state, init_seq, init_outputs):
@@ -547,7 +542,6 @@ class AttentionModel(nn.Module):
                 self.sequences = init_seq
                 self.outputs = init_outputs
         beam_states = [(BeamState(state, [], []), 0.0)] # (BeamState, score 概率和) 用于剪枝
-        # a = {'probs': [], 'nodes': []}
         while not beam_states[0][0].state.all_finished():
             new_beam_states = []
             for i in range(len(beam_states)):
@@ -555,9 +549,6 @@ class AttentionModel(nn.Module):
 
                     log_p, mask = self._get_log_p(fixed, beam_state.state, mat, input)
                     topk_probs, topk_nodes = torch.topk(log_p[:, 0, :], beam_width)
-                    # if i == 0:
-                    #     a["probs"].append(topk_probs[0][0])
-                    #     a["nodes"].append(topk_nodes[0][0])
                     for j in range(beam_width):
                         sequences = beam_state.sequences  + [topk_nodes[:, j]]
                         outputs = beam_state.outputs + [log_p[:, 0, :]]
@@ -572,15 +563,6 @@ class AttentionModel(nn.Module):
             # 剪枝，取最大的几个
             new_beam_states = heapq.nlargest(beam_width, new_beam_states, key=lambda x: x[1])
             beam_states = new_beam_states
-
-        # costs = torch.zeros((1, len(beam_states)))
-        # for i in range(len(beam_states)):
-        #     sequences = torch.stack(beam_states[i][0].sequences, 1)
-        #     cost, _ = get_costs(input, sequences, beam_states[i][0].state, mat)
-        #     costs[0][i] = torch.mean(cost)
-        #
-        # _, idx = torch.sort(costs)
-        # idx = idx[0][0].item()
 
         return (torch.stack(beam_states[0][0].outputs, 1),
                 torch.stack(beam_states[0][0].sequences, 1),
@@ -623,14 +605,15 @@ class AttentionModel(nn.Module):
         return torch.stack(outputs, 1), torch.stack(sequences, 1), state
         """
         if self.decode_type == "greedy":
-            return self._beam_search(input, fixed, mat, state, self.beam_width)
-        elif self.decode_type == "sampling":
-            # _log_p1, pi1, state2 = self._beam_search(input, fixed, mat, state, self.beam_width)
-            # cost2, _ = get_costs(input, pi1, state2, mat)
-            # _log_p, pi, state1 =
-            # cost1, _ = get_costs(input, pi, state1, mat)
-            # print("greedy mean cost: {}, beam search mean cost: {}".format(torch.mean(cost1), torch.mean(cost2)))
             return self._sampling(input, fixed, mat, state)
+        elif self.decode_type == "sampling":
+            _log_p1, pi1, state1 = self._sampling(input, fixed, mat, state)
+            cost1, _ = get_costs(input, pi1, state1, mat)
+            _log_p2, pi2, state2 = self._beam_search(input, fixed, mat, state, self.beam_width)
+            cost2, _ = get_costs(input, pi2, state2, mat)
+            if torch.mean(cost1) <= torch.mean(cost2):
+                return _log_p1, pi1, state1
+            return _log_p2, pi2, state2
 
         assert False, "Unknown decode type"
 

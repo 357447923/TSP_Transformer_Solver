@@ -219,7 +219,7 @@ class RolloutBaseline(Baseline):
             if len(dataset) != self.opts.val_size:
                 print("Warning: not using saved baseline dataset since val_size does not match")
                 dataset = None
-            elif dataset[0].size(0) != self.opts.graph_size:
+            elif dataset[0].size(0) != self.opts.graph_size + 1:
                 print("Warning: not using saved baseline dataset since graph_size does not match")
                 dataset = None
 
@@ -292,6 +292,7 @@ class RolloutBaseline(Baseline):
                 print('Update baseline')
                 self._update_model(model, epoch) # TODO 文档标注此处为θ*更新完毕
         elif epoch - self.epoch > 99 and epoch - self.last > 99:
+            print("reload")
             self._reload_model(model)
             self.last = epoch
     def state_dict(self):
