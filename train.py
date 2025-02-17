@@ -21,17 +21,41 @@ warnings = warnings.filterwarnings("ignore")
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 class Cities:
-    def __init__(self, n_cities = 100):
+    def __init__(self, n_cities=100, load_dir=None):
+        def read_tsp_coordinates(file_name):
+            coordinates = []
+            with open(file_name, 'r') as f:
+                read_data = False
+                for line in f:
+                    line = line.strip()
+                    if line == "NODE_COORD_SECTION":
+                        read_data = True
+                        continue
+                    if line == "EOF":
+                        break
+                    if read_data:
+                        parts = line.split()
+                        x, y = float(parts[1]), float(parts[2])
+                        coordinates.append((x, y))
+            return np.array(coordinates)
         self.n_cities = n_cities
-        self.cities = torch.rand((n_cities, 2))
+        if load_dir is None:
+            self.cities = torch.rand((n_cities, 2), device=device) * 1.
+        else:
+            self.cities = torch.from_numpy(read_tsp_coordinates(load_dir))
     def __getdis__(self,i, j):
         return torch.sqrt(torch.sum(torch.pow(torch.sub(self.cities[i], self.cities[j]), 2)))
 
 class DistanceMatrix:
     # DistanceMatrix类用于模拟城市间，并实现基于时间变化的距离矩阵
-    def __init__(self, ci, max_time_step = 100, load_dir = None):
+    # def __init__(self, ci, max_time_step = 100, load_dir = None):
+    def __init__(self, ci):
         self.n_c = ci.n_cities
+        self.cities = ci.cities
+        self.cities_distance = torch.cdist(self.cities, self.cities).to(device)
+        """
         self.max_time_step = max_time_step
         with torch.no_grad():
             self.mat = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
@@ -52,54 +76,63 @@ class DistanceMatrix:
                         self.m3[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[1], device=device)
                         self.m2[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[2], device=device)
                         self.mat[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[3], device=device)
+    """
     # 与getddd 都用于获取在某一特定时间t下，由状态向量st中指定的城市a和b的距离估计
     # 但getd针对单个时间点和一对城市计算距离，而getddd是批量处理计算
-    def __getd__(self, st, a, b, t):
+    def __getd__(self, st, a, b):
         a = torch.gather(st, 1, a)
         b = torch.gather(st, 1, b)
-        tt = torch.floor(t * self.max_time_step) % self.max_time_step
-        zz = (torch.floor(t * self.max_time_step) + 1) % self.max_time_step
-        c = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + tt.squeeze().long()
-        d = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + zz.squeeze().long() 
-        a0 = torch.gather(self.mat, 0, c)
-        a1 = torch.gather(self.m2, 0, c)
-        a2 = torch.gather(self.m3, 0, c)
-        a3 = torch.gather(self.m4, 0, c)
-        b0 = torch.gather(self.mat, 0, d)
-        z = (t.squeeze() * self.max_time_step - torch.floor(t.squeeze() * self.max_time_step)) / self.max_time_step
-        z2 = z * z
-        z3 = z2 * z
-        res = a0 + a1 * z + a2 * z2 + a3 * z3
-        minres = (a0 + b0) * 0.05
-        maxres = (a0 + b0) * 5
-        res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
-        res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
+        cities = self.cities.repeat(st.size(0), 1, 1)
+        city_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
+        city_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
+        # tt = torch.floor(t * self.max_time_step) % self.max_time_step
+        # zz = (torch.floor(t * self.max_time_step) + 1) % self.max_time_step
+        # c = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + tt.squeeze().long()
+        # d = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + zz.squeeze().long()
+        # a0 = torch.gather(self.mat, 0, c)
+        # a1 = torch.gather(self.m2, 0, c)
+        # a2 = torch.gather(self.m3, 0, c)
+        # a3 = torch.gather(self.m4, 0, c)
+        # b0 = torch.gather(self.mat, 0, d)
+        # z = (t.squeeze() * self.max_time_step - torch.floor(t.squeeze() * self.max_time_step)) / self.max_time_step
+        # z2 = z * z
+        # z3 = z2 * z
+        # res = a0 + a1 * z + a2 * z2 + a3 * z3
+        # minres = (a0 + b0) * 0.05
+        # maxres = (a0 + b0) * 5
+        # res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
+        # res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
+        res = torch.cdist(city_a, city_b) # 计算二维欧氏距离
         return res
-    def __getddd__(self, st, a, b, t):
-        s0, s1 = a.size(0), a.size(1)
+    def __getddd__(self, st, a, b):
+        s0, s1 = a.size(0), a.size(1) * b.size(1)
         a = torch.gather(st, 1, a)
         b = torch.gather(st, 1, b)
-        tt = torch.round(t * self.max_time_step) % self.max_time_step
-        zz = (torch.round(t * self.max_time_step) + 1) % self.max_time_step 
-        c = a * self.n_c * self.max_time_step + b * self.max_time_step + tt.long()
-        c = c.view(-1)
-        d = a * self.n_c * self.max_time_step + b * self.max_time_step + zz.long()
-        d = d.view(-1)
-        a0 = torch.gather(self.mat, 0, c)
-        a1 = torch.gather(self.m2, 0, c)
-        a2 = torch.gather(self.m3, 0, c)
-        a3 = torch.gather(self.m4, 0, c)
-        b0 = torch.gather(self.mat, 0, d)
-        tt = tt.view(-1)
-        ttt = t.expand(s0, s1).contiguous().view(-1)
-        z = (ttt * self.max_time_step - torch.floor(ttt * self.max_time_step)) / self.max_time_step 
-        z2 = z * z
-        z3 = z2 * z
-        res = a0 + a1 * z + a2 * z2 + a3 * z3
-        minres = (a0 + b0) * 0.05
-        maxres = (a0 + b0) * 5
-        res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
-        res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
+        cities = self.cities.repeat(st.size(0), 1, 1).to(st.device)
+        cities_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
+        cities_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
+        # tt = torch.round(t * self.max_time_step) % self.max_time_step
+        # zz = (torch.round(t * self.max_time_step) + 1) % self.max_time_step
+        # c = a * self.n_c * self.max_time_step + b * self.max_time_step + tt.long()
+        # c = c.view(-1)
+        # d = a * self.n_c * self.max_time_step + b * self.max_time_step + zz.long()
+        # d = d.view(-1)
+        # a0 = torch.gather(self.mat, 0, c)
+        # a1 = torch.gather(self.m2, 0, c)
+        # a2 = torch.gather(self.m3, 0, c)
+        # a3 = torch.gather(self.m4, 0, c)
+        # b0 = torch.gather(self.mat, 0, d)
+        # tt = tt.view(-1)
+        # ttt = t.expand(s0, s1).contiguous().view(-1)
+        # z = (ttt * self.max_time_step - torch.floor(ttt * self.max_time_step)) / self.max_time_step
+        # z2 = z * z
+        # z3 = z2 * z
+        # res = a0 + a1 * z + a2 * z2 + a3 * z3
+        # minres = (a0 + b0) * 0.05
+        # maxres = (a0 + b0) * 5
+        # res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
+        # res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
+        res = torch.cdist(cities_a, cities_b)
         return res.view(s0, s1)
 # rollout 和 roll分别用于执行模型的评估过程，遍历数据集并在贪心解码模式下计算每批数据的成本
 def rollout(mat, model, dataset, opts):
@@ -174,7 +207,8 @@ class TSPDataset(Dataset):
 
         self.data_set = []
         l = torch.rand((num_samples, ci.n_cities - 1)) # 随机生成城市坐标
-        sorted, ind = torch.sort(l)
+        _, ind = torch.sort(l)
+        ind = ind.to(device)
         ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
         ind = ind[:,:size,:] + 1
         ff = ci.cities.unsqueeze(0)
@@ -183,16 +217,11 @@ class TSPDataset(Dataset):
         f = f.permute(0,2,1) # 把形状(1000, 19, 2) 调为 (1000,2,19)
         depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1) # 看到这块，我感觉应该得结合论文的第四部分的Part A看
         self.static = torch.cat((depot, f), dim = 2)
-        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long)
+        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
         ind = ind[:,:,0:1]
         ind = torch.cat((depot, ind), dim=1)
-        self.data = torch.zeros(num_samples, size+1, ci.n_cities)
+        self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
         self.data = self.data.scatter_(2, ind, 1.)
-        # q = torch.randn((num_samples, size, 1), dtype=torch.float)  # 起点的容量为0
-        # for i in range(num_samples):    # 保证走完全程后负载非负
-        #     if q[i].sum() < 0:
-        #         q[i] = -q[i]
-        # self.quality = torch.cat((depot, q), dim=1)
         self.size = len(self.data)
     def __len__(self):
         return self.size
@@ -375,12 +404,13 @@ def run(opts):
     # mat包含了ci，这一步之后，才把data.csv数据读入，并且分为12个时间段
     # 并且在该模型中，距离是用时间来进行评估的，生成距离向量中采用三次样条插值
     # 的目的在于得到估计的旅行时间函数f_i_j(t)
-    mat = DistanceMatrix(ci, load_dir='./data.csv', max_time_step = 12)
-    np.savetxt('var.txt', mat.var.cpu().numpy(), fmt='%.6f')
-    np.savetxt('mat.txt', mat.mat.cpu().numpy(), fmt='%.6f')
-    np.savetxt('m2.txt', mat.m2.cpu().numpy(), fmt='%.6f')
-    np.savetxt('m3.txt', mat.m3.cpu().numpy(), fmt='%.6f')
-    np.savetxt('m4.txt', mat.m4.cpu().numpy(), fmt='%.6f')
+    # mat = DistanceMatrix(ci, load_dir='./data.csv', max_time_step = 12)
+    mat = DistanceMatrix(ci)
+    # np.savetxt('var.txt', mat.var.cpu().numpy(), fmt='%.6f')
+    # np.savetxt('mat.txt', mat.mat.cpu().numpy(), fmt='%.6f')
+    # np.savetxt('m2.txt', mat.m2.cpu().numpy(), fmt='%.6f')
+    # np.savetxt('m3.txt', mat.m3.cpu().numpy(), fmt='%.6f')
+    # np.savetxt('m4.txt', mat.m4.cpu().numpy(), fmt='%.6f')
     # Initialize model
     # 选择注意力模型类
     model_class = AttentionModel
@@ -397,7 +427,8 @@ def run(opts):
         shrink_size=opts.shrink_size,   # 放缩大小
         input_size=opts.graph_size+1,   # 输入大小
         max_t=12,    # 最大时间步长
-        beam_width=opts.beam_width
+        beam_width=opts.beam_width,
+        max_seq_len=20
     ).to(opts.device)
 
     # Overwrite model parameters by parameters to load
@@ -452,7 +483,7 @@ def run(opts):
     val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, filename=opts.val_dataset, distribution=opts.data_distribution)
 
     _,ind = torch.max(val_dataset.data, dim=2)
-    np.savetxt('valid_data.txt', ind.numpy(), fmt='%d')
+    np.savetxt('valid_data.txt', ind.cpu().numpy(), fmt='%d')
     # 继续上次训练没完成的模型
     if opts.resume:
         epoch_resume = int(os.path.splitext(os.path.split(opts.resume)[-1])[0].split("-")[1])
@@ -489,7 +520,7 @@ def run(opts):
     model2 = baseline.baseline.model
     ans, cost = roll(mat, model2, val_dataset, opts)
     print('Avg cost:', torch.mean(cost)*1440)
-    np.savetxt('answer.txt', ans.numpy(), fmt='%d')
-    np.savetxt('costs.txt', cost.numpy(), fmt='%.6f')
+    np.savetxt('answer.txt', ans.cpu().numpy(), fmt='%d')
+    np.savetxt('costs.txt', cost.cpu().numpy(), fmt='%.6f')
 if __name__ == "__main__":
     run(get_options())

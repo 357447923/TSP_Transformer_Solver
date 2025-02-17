@@ -18,8 +18,9 @@ class TSPDataset(Dataset):
         super(TSPDataset, self).__init__()
 
         self.data_set = []
-        l = torch.rand((num_samples, ci.n_cities - 1))
-        sorted, ind = torch.sort(l)
+        l = torch.rand((num_samples, ci.n_cities - 1), device=device)
+        _, ind = torch.sort(l)
+        ind = ind.to(device)
         ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
         ind = ind[:,:size,:] + 1
         ff = ci.cities.unsqueeze(0)
@@ -28,11 +29,11 @@ class TSPDataset(Dataset):
         f = f.permute(0,2,1)
         depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1)
         self.static = torch.cat((depot, f), dim = 2)
-        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long)
+        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
         ind = ind[:,:,0:1]
         ind = torch.cat((depot, ind), dim=1)
 
-        self.data = torch.zeros(num_samples, size+1, ci.n_cities)
+        self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
 
         self.data = self.data.scatter_(2, ind, 1.)
         self.size = len(self.data)

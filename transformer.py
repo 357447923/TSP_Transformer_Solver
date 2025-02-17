@@ -10,6 +10,7 @@ from typing import NamedTuple
 import warnings
 
 from torch.onnx.symbolic_opset9 import tensor
+from torch.onnx.utils import attr_pattern
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -231,7 +232,6 @@ class MultiHeadAttentionLayer(nn.Sequential):
             Normalization(embed_dim, normalization)
         )
 
-
 class GraphAttentionEncoder(nn.Module):
     def __init__(
             self,
@@ -267,19 +267,39 @@ class GraphAttentionEncoder(nn.Module):
             h.mean(dim=1),  # average to get embedding of graph, (batch_size, embed_dim)
         )
 
+
+
+def generate_positional_encoding(d_model, max_len):
+    """
+    Create standard transformer PEs.
+    Inputs :
+      d_model is a scalar correspoding to the hidden dimension
+      max_len is the maximum length of the sequence
+    Output :
+      pe of size (max_len, d_model), where d_model=dim_emb, max_len=1000
+    """
+    pe = torch.zeros(max_len, d_model).to(device)
+    position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1).to(device)
+    div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model)).to(device)
+    pe[:,0::2] = torch.sin(position * div_term)
+    pe[:,1::2] = torch.cos(position * div_term)
+    return pe
+
 def get_costs(dataset, pi, state, mat):
     depots = torch.zeros(pi.size(0), 1).long().to(device)
     _,ind = torch.max(dataset, dim=2)
-    bdd = mat.var[state.prev_a.squeeze() * mat.n_c].unsqueeze(1)
-    bdd = torch.randn(state.prev_a.size(0), device=device) * bdd
-    add = mat.__getd__(ind, state.prev_a, depots, state.lengths).unsqueeze(1)
-    bdd = bdd.repeat(1, 2)
-    bdd[:,1] = add.squeeze() * 5
-    bdd = torch.min(bdd, dim=1)[0]
-    bdd = bdd[:, None].repeat(1, 2)
-    bdd[:,1] = add.squeeze() * -0.9
-    bdd = torch.max(bdd, dim=1)[0]
-    return state.lengths.squeeze() + add.squeeze() + bdd.squeeze(), None
+    # bdd = mat.var[state.prev_a.squeeze() * mat.n_c].unsqueeze(1)
+    # bdd = torch.randn(state.prev_a.size(0), device=device) * bdd
+    # add = mat.__getd__(ind, state.prev_a, depots, state.lengths).unsqueeze(1)
+    add = mat.__getd__(ind, state.prev_a, depots).unsqueeze(1)
+    # bdd = bdd.repeat(1, 2)
+    # bdd[:,1] = add.squeeze() * 5
+    # bdd = torch.min(bdd, dim=1)[0]
+    # bdd = bdd[:, None].repeat(1, 2)
+    # bdd[:,1] = add.squeeze() * -0.9
+    # bdd = torch.max(bdd, dim=1)[0]
+    # return state.lengths.squeeze() + add.squeeze() + bdd.squeeze(), None
+    return state.lengths.squeeze() + add.squeeze(), None
 
 class StateTSP(NamedTuple):
     # Fixed input
@@ -355,23 +375,23 @@ class StateTSP(NamedTuple):
     def update(self, selected, mat, input):
 
         # Update the state
-        prev_a = selected[:, None]  # Add dimension for step
-
+        next_node = selected[:, None]  # Add dimension for step
         _,ind = torch.max(input, dim=2)
-        bdd = mat.var[self.prev_a.squeeze() * mat.n_c + prev_a.squeeze()].unsqueeze(1)
-        add = mat.__getd__(ind, self.prev_a, prev_a, self.lengths).unsqueeze(1)
-        bdd = torch.randn(prev_a.size(0), 1, device=device) * bdd
-        bdd = bdd.repeat(1, 2)
-        bdd[:, 1] = add.squeeze() * 5 #UB
-        bdd = torch.min(bdd, dim=1)[0]
-        bdd = bdd[:, None].repeat(1, 2)
-        bdd[:, 1] = add.squeeze() * -0.9 #LB
-        bdd = torch.max(bdd, dim=1)[0]
-        lengths = self.lengths + add + bdd[:, None]
+        # bdd = mat.var[self.prev_a.squeeze() * mat.n_c + next_node.squeeze()].unsqueeze(1)
+        # add = mat.__getd__(ind, self.prev_a, next_node, self.lengths).unsqueeze(1)
+        add = mat.__getd__(ind, self.prev_a, next_node).reshape(-1, 1)
+        # bdd = torch.randn(next_node.size(0), 1, device=device) * bdd
+        # bdd = bdd.repeat(1, 2)
+        # bdd[:, 1] = add.squeeze() * 5 # UB
+        # bdd = torch.min(bdd, dim=1)[0]
+        # bdd = bdd[:, None].repeat(1, 2)
+        # bdd[:, 1] = add.squeeze() * -0.9 # LB
+        # bdd = torch.max(bdd, dim=1)[0]
+        # lengths = self.lengths + add + bdd[:, None]
+        lengths = self.lengths + add
+        visited_ = self.visited_.scatter(-1, next_node[:, :, None], 1)
 
-        visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1)
-
-        return self._replace(prev_a=prev_a, visited_=visited_, lengths=lengths, i=self.i + 1)
+        return self._replace(prev_a=next_node, visited_=visited_, lengths=lengths, i=self.i + 1)
 
     def all_finished(self):
         # Exactly n steps
@@ -420,7 +440,8 @@ class AttentionModel(nn.Module):
                  shrink_size=None,
                  input_size=4,
                  max_t=12,
-                 beam_width=2):
+                 beam_width=2,
+                 max_seq_len=20):
         
         super(AttentionModel, self).__init__()
         self.embedding_dim = embedding_dim
@@ -455,18 +476,21 @@ class AttentionModel(nn.Module):
         self.project_node_embeddings = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
         self.project_fixed_context = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.project_step_context = nn.Linear(step_context_dim, embedding_dim, bias=False)
-        self.embed_static_traffic = nn.Linear(node_dim * max_t, embedding_dim)
+        # self.embed_static_traffic = nn.Linear(node_dim * max_t, embedding_dim)
+        self.embed_static_traffic = nn.Linear(node_dim, embedding_dim)
         self.embed_static = nn.Linear(2 * embedding_dim, embedding_dim)
         assert embedding_dim % n_heads == 0
         # Note n_heads * val_dim == embedding_dim so input to project_out is embedding_dim
         self.project_out = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.project_traffic = nn.Linear(input_size*input_size, embedding_dim, bias=False)
         self.project_visit = nn.Linear(input_size, embedding_dim, bias=False)
-        self.xx = torch.tensor([[i for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
-        self.yy = torch.tensor([[j for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
+        # self.xx = torch.tensor([[i for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
+        # self.yy = torch.tensor([[j for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
+        self.xx = torch.range(0, input_size - 1, dtype=torch.int64, device=device).view(1, input_size)
+        self.yy = torch.range(0, input_size - 1, dtype=torch.int64, device=device).view(1, input_size)
         # xx，yy都是三维的
-        print(self.xx.ndim)
-        print(self.yy.ndim)
+        # print(self.xx.ndim)
+        # print(self.yy.ndim)
     def set_decode_type(self, decode_type, temp=None):
         self.decode_type = decode_type
         if temp is not None:  # Do not change temperature if not provided
@@ -481,9 +505,10 @@ class AttentionModel(nn.Module):
         """
         # Linear层 in: 100 out: 128 bias: True
         x = self._init_embed(input) # 将每个客户节点i转换为ID嵌入x_i
-        z = mat.mat.reshape(1, 100, 1200).repeat(input.size(0), 1, 1) # 将100个节点不同时间段的距离（时间距离）扩展为input的batch_size，方便使用
+        # z = mat.mat.reshape(1, 100, 1200).repeat(input.size(0), 1, 1) # 将100个节点不同时间段的距离（时间距离）扩展为input的batch_size，方便使用
         _, ind = torch.max(input, dim=2)
-        tr = z.gather(1, ind.view(input.size(0), -1, 1).expand(input.size(0), input.size(1), 1200)) # 应该是获取当前批次要访问的节点在各个时间的时间距离
+        z = mat.cities_distance.reshape(1, 100, 100).repeat(input.size(0), 1, 1)
+        tr = z.gather(1, ind.view(input.size(0), -1, 1).expand(input.size(0), input.size(1), 100)) # 应该是获取当前批次要访问的节点在各个时间的时间距离
         y = self.embed_static_traffic(tr) # 将估计的流量状况(mat)转化为流量嵌入y_i  # TODO 论文指出在DPDP数据集中还嵌入了运输量q，但我还没发现相关代码
         # 编码器执行，输出每个节点的特以及整个图
         embeddings, _ = self.embedder(self.embed_static(torch.cat((x, y), dim = 2))) # 将x和y连接起来，产生{h^(0)_0},并且作为图注意力编码器的前向传播的输入
@@ -577,20 +602,18 @@ class AttentionModel(nn.Module):
         :output output: p0, ..., pc
         :output sequences: 节点访问选择顺序
         """
+        outputs = []
+        sequences = []
         state = StateTSP.initialize(input)
         state = state.addmask() # mask用于记录是否已经访问
 
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
-        batch_size = state.ids.size(0)
-
         # Perform decoding steps 执行解码步骤
         fixed = self._precompute(embeddings)
         # 论文中讲的多次解码，就是通过这个while循环中实现的
-        """
         while not (state.all_finished()): # 访问完20个节点则while结束，这个20是由opt.graph_size控制
             # 获取20个节点的选择概率，以及掩码（visited）
             log_p, mask = self._get_log_p(fixed, state, mat, input)     # self-attention feed_back mask
-
 
             # Select the indices of the next nodes in the sequences, result (batch_size) long
             selected = self._select_node(log_p.exp()[:, 0, :], mask[:, 0, :])  # Squeeze out steps dimension
@@ -603,19 +626,14 @@ class AttentionModel(nn.Module):
         # Collected lists, return Tensor
         # TODO 描述数据，打印出sequences，然后描述数据变化。 把程序执行顺序记下来
         return torch.stack(outputs, 1), torch.stack(sequences, 1), state
-        """
-        if self.decode_type == "greedy":
-            return self._sampling(input, fixed, mat, state)
-        elif self.decode_type == "sampling":
-            _log_p1, pi1, state1 = self._sampling(input, fixed, mat, state)
-            cost1, _ = get_costs(input, pi1, state1, mat)
-            _log_p2, pi2, state2 = self._beam_search(input, fixed, mat, state, self.beam_width)
-            cost2, _ = get_costs(input, pi2, state2, mat)
-            if torch.mean(cost1) <= torch.mean(cost2):
-                return _log_p1, pi1, state1
-            return _log_p2, pi2, state2
 
-        assert False, "Unknown decode type"
+
+        # if self.decode_type == "greedy":
+        #     return self._beam_search(input, fixed, mat, state, self.beam_width)
+        # elif self.decode_type == "sampling":
+        #     return self._sampling(input, fixed, mat, state)
+        #
+        # assert False, "Unknown decode type"
 
     def _precompute(self, embeddings, num_steps=1):
 
@@ -650,7 +668,7 @@ class AttentionModel(nn.Module):
                 self.project_step_context(self._get_parallel_step_context(fixed.node_embeddings, state, mat, input))
 
         # Compute keys and values for the nodes
-        glimpse_K, glimpse_V, logit_K = self._get_attention_node_data(fixed, state) # TODO 解码器这块论文也没看太懂
+        glimpse_K, glimpse_V, logit_K = self._get_attention_node_data(fixed, state)
 
         # Compute the mask
         mask = state.get_mask()
@@ -758,7 +776,8 @@ class AttentionModel(nn.Module):
         """
         b_s, i_s = embeddings.size(0), embeddings.size(1)
         _, ind = torch.max(input, dim=2)
-        current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1, 1).view(b_s, i_s*i_s), self.yy.repeat(b_s, 1, 1).view(b_s, i_s*i_s), state.lengths).view(b_s, 1, i_s*i_s))
+        # current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1, 1).view(b_s, i_s*i_s), self.yy.repeat(b_s, 1, 1).view(b_s, i_s*i_s), state.lengths).view(b_s, 1, i_s*i_s))
+        current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1).view(b_s, i_s), self.yy.repeat(b_s, 1).view(b_s, i_s)).view(b_s, 1, i_s * i_s))
         current_visit = self.project_visit(state.visited_.float())
         ss = embeddings.gather(1, torch.cat((state.first_a, state.prev_a), 1)[:, :, None].expand(b_s, 2, embeddings.size(-1)))
         return torch.cat((ss.view(b_s, 1, -1), current_traffic, current_visit), dim=2)
