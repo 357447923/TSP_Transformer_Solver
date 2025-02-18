@@ -14,28 +14,32 @@ def set_decode_type(model, decode_type):
 
 class TSPDataset(Dataset):
     
-    def __init__(self, ci, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
+    def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
         super(TSPDataset, self).__init__()
 
-        self.data_set = []
-        l = torch.rand((num_samples, ci.n_cities - 1), device=device)
-        _, ind = torch.sort(l)
-        ind = ind.to(device)
-        ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
-        ind = ind[:,:size,:] + 1
-        ff = ci.cities.unsqueeze(0)
-        ff = ff.expand(num_samples, ci.n_cities, 2)
-        f = torch.gather(ff, dim = 1, index = ind)
-        f = f.permute(0,2,1)
-        depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1)
-        self.static = torch.cat((depot, f), dim = 2)
-        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
-        ind = ind[:,:,0:1]
-        ind = torch.cat((depot, ind), dim=1)
+        # self.data_set = []
+        # l = torch.rand((num_samples, ci.n_cities - 1), device=device)
+        # _, ind = torch.sort(l)
+        # ind = ind.to(device)
+        # ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
+        # ind = ind[:,:size,:] + 1
+        # ff = ci.cities.unsqueeze(0)
+        # ff = ff.expand(num_samples, ci.n_cities, 2)
+        # f = torch.gather(ff, dim = 1, index = ind)
+        # f = f.permute(0,2,1)
+        # depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1)
+        # self.static = torch.cat((depot, f), dim = 2)
+        # depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
+        # ind = ind[:,:,0:1]
+        # ind = torch.cat((depot, ind), dim=1)
+        #
+        # self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
+        #
+        # self.data = self.data.scatter_(2, ind, 1.)
+        # self.size = len(self.data)
+        data = [torch.FloatTensor(size, 2).uniform_(0, 1) for _ in range(num_samples)]
+        self.data = torch.stack(data, dim=0).to(device)
 
-        self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
-
-        self.data = self.data.scatter_(2, ind, 1.)
         self.size = len(self.data)
     def __len__(self):
         return self.size
@@ -44,14 +48,14 @@ class TSPDataset(Dataset):
         return self.data[idx]
 def get_inner_model(model):
     return model
-def rollout(mat, model, dataset, opts):
+def rollout(model, dataset, opts):
     # Put in greedy evaluation mode!
     set_decode_type(model, "greedy")
     model.eval()
 
     def eval_model_bat(bat):
         with torch.no_grad():
-            cost, _, _ = model(mat, move_to(bat, opts.device))
+            cost, _, _ = model(move_to(bat, opts.device))
         return cost.data.cpu()
 
     return torch.cat([
@@ -200,11 +204,9 @@ class CriticBaseline(Baseline):
 
 class RolloutBaseline(Baseline):
 
-    def __init__(self, mat, ci, model, opts, epoch=0):
+    def __init__(self, model, opts, epoch=0):
         super(Baseline, self).__init__()
-        self.mat = mat
         self.opts = opts
-        self.ci = ci
         self.last = 0
         self._update_model(model, epoch)
 
@@ -220,17 +222,17 @@ class RolloutBaseline(Baseline):
             if len(dataset) != self.opts.val_size:
                 print("Warning: not using saved baseline dataset since val_size does not match")
                 dataset = None
-            elif dataset[0].size(0) != self.opts.graph_size + 1:
+            elif dataset[0].size(0) != self.opts.graph_size:
                 print("Warning: not using saved baseline dataset since graph_size does not match")
                 dataset = None
 
         if dataset is None: # 为基线生成验证数据集
-            self.dataset = TSPDataset(self.ci, size=self.opts.graph_size, num_samples=self.opts.val_size, distribution=self.opts.data_distribution)
+            self.dataset = TSPDataset(size=self.opts.graph_size, num_samples=self.opts.val_size, distribution=self.opts.data_distribution)
         else:
             self.dataset = dataset
         print("Evaluating baseline model on evaluation dataset")
 
-        self.bl_vals = rollout(self.mat, self.model, self.dataset, self.opts).cpu().numpy() # 用新生成的数据集去跑当前基线中的模型
+        self.bl_vals = rollout(self.model, self.dataset, self.opts).cpu().numpy() # 用新生成的数据集去跑当前基线中的模型
         self.mean = self.bl_vals.mean()
         self.epoch = epoch
 
@@ -245,7 +247,7 @@ class RolloutBaseline(Baseline):
         print("Evaluating baseline on dataset...")
         # Need to convert baseline to 2D to prevent converting to double, see
         # https://discuss.pytorch.org/t/dataloader-gives-double-instead-of-float/717/3
-        return BaselineDataset(dataset, rollout(self.mat, self.model, dataset, self.opts).view(-1, 1))
+        return BaselineDataset(dataset, rollout(self.model, dataset, self.opts).view(-1, 1))
 
     def unwrap_batch(self, batch):
         return batch['data'], batch['baseline'].view(-1)  # Flatten result to undo wrapping as 2D
@@ -253,7 +255,7 @@ class RolloutBaseline(Baseline):
     def eval(self, x, c):
         # Use volatile mode for efficient inference (single batch so we do not use rollout function)
         with torch.no_grad():
-            v, _ = self.model(self.mat, x, self.model1, self.model2)
+            v, _ = self.model(x, self.model1, self.model2)
 
         # There is no loss
         return v, 0
@@ -266,7 +268,7 @@ class RolloutBaseline(Baseline):
         """
         print("Evaluating candidate model on evaluation dataset")
         # 用基线中的数据集跑一次model
-        candidate_vals = rollout(self.mat, model, self.dataset, self.opts).cpu().numpy()
+        candidate_vals = rollout(model, self.dataset, self.opts).cpu().numpy()
 
         candidate_mean = candidate_vals.mean()
 

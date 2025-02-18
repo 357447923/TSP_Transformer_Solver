@@ -48,108 +48,22 @@ class Cities:
     def __getdis__(self,i, j):
         return torch.sqrt(torch.sum(torch.pow(torch.sub(self.cities[i], self.cities[j]), 2)))
 
-class DistanceMatrix:
-    # DistanceMatrix类用于模拟城市间，并实现基于时间变化的距离矩阵
-    # def __init__(self, ci, max_time_step = 100, load_dir = None):
-    def __init__(self, ci):
-        self.n_c = ci.n_cities
-        self.cities = ci.cities
-        self.cities_distance = torch.cdist(self.cities, self.cities).to(device)
-        """
-        self.max_time_step = max_time_step
-        with torch.no_grad():
-            self.mat = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
-            self.m2 = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
-            self.m3 = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
-            self.m4 = torch.zeros(self.n_c * self.n_c * max_time_step, device=device)
-            self.var = torch.full((ci.n_cities * ci.n_cities, 1), 0.00, device = device).view(-1)
-            if (load_dir is not None):
-                temp = np.loadtxt(load_dir, delimiter=',', skiprows=0)
-                x = np.arange(max_time_step + 1)
-                # 遍历数组，拟合并存储数据
-                for k in range(self.n_c):
-                    for j in range(self.n_c):
-                        i = k * self.n_c + j
-                        # 三次样条插值
-                        cs = CubicSpline(x, np.concatenate((temp[i], [temp[i,0]]), axis=0), bc_type='periodic')
-                        self.m4[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[0], device=device)
-                        self.m3[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[1], device=device)
-                        self.m2[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[2], device=device)
-                        self.mat[i * max_time_step : i * max_time_step + 12] = torch.tensor(cs.c[3], device=device)
-    """
-    # 与getddd 都用于获取在某一特定时间t下，由状态向量st中指定的城市a和b的距离估计
-    # 但getd针对单个时间点和一对城市计算距离，而getddd是批量处理计算
-    def __getd__(self, st, a, b):
-        a = torch.gather(st, 1, a)
-        b = torch.gather(st, 1, b)
-        cities = self.cities.repeat(st.size(0), 1, 1)
-        city_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
-        city_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
-        # tt = torch.floor(t * self.max_time_step) % self.max_time_step
-        # zz = (torch.floor(t * self.max_time_step) + 1) % self.max_time_step
-        # c = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + tt.squeeze().long()
-        # d = a.squeeze() * self.n_c * self.max_time_step + b.squeeze() * self.max_time_step + zz.squeeze().long()
-        # a0 = torch.gather(self.mat, 0, c)
-        # a1 = torch.gather(self.m2, 0, c)
-        # a2 = torch.gather(self.m3, 0, c)
-        # a3 = torch.gather(self.m4, 0, c)
-        # b0 = torch.gather(self.mat, 0, d)
-        # z = (t.squeeze() * self.max_time_step - torch.floor(t.squeeze() * self.max_time_step)) / self.max_time_step
-        # z2 = z * z
-        # z3 = z2 * z
-        # res = a0 + a1 * z + a2 * z2 + a3 * z3
-        # minres = (a0 + b0) * 0.05
-        # maxres = (a0 + b0) * 5
-        # res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
-        # res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
-        res = torch.cdist(city_a, city_b) # 计算二维欧氏距离
-        return res
-    def __getddd__(self, st, a, b):
-        s0, s1 = a.size(0), a.size(1) * b.size(1)
-        a = torch.gather(st, 1, a)
-        b = torch.gather(st, 1, b)
-        cities = self.cities.repeat(st.size(0), 1, 1).to(st.device)
-        cities_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
-        cities_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
-        # tt = torch.round(t * self.max_time_step) % self.max_time_step
-        # zz = (torch.round(t * self.max_time_step) + 1) % self.max_time_step
-        # c = a * self.n_c * self.max_time_step + b * self.max_time_step + tt.long()
-        # c = c.view(-1)
-        # d = a * self.n_c * self.max_time_step + b * self.max_time_step + zz.long()
-        # d = d.view(-1)
-        # a0 = torch.gather(self.mat, 0, c)
-        # a1 = torch.gather(self.m2, 0, c)
-        # a2 = torch.gather(self.m3, 0, c)
-        # a3 = torch.gather(self.m4, 0, c)
-        # b0 = torch.gather(self.mat, 0, d)
-        # tt = tt.view(-1)
-        # ttt = t.expand(s0, s1).contiguous().view(-1)
-        # z = (ttt * self.max_time_step - torch.floor(ttt * self.max_time_step)) / self.max_time_step
-        # z2 = z * z
-        # z3 = z2 * z
-        # res = a0 + a1 * z + a2 * z2 + a3 * z3
-        # minres = (a0 + b0) * 0.05
-        # maxres = (a0 + b0) * 5
-        # res,_ = torch.max(torch.cat((res.unsqueeze(-1), minres.unsqueeze(-1)), dim = -1), dim = -1)
-        # res,_ = torch.min(torch.cat((res.unsqueeze(-1), maxres.unsqueeze(-1)), dim = -1), dim = -1)
-        res = torch.cdist(cities_a, cities_b)
-        return res.view(s0, s1)
 # rollout 和 roll分别用于执行模型的评估过程，遍历数据集并在贪心解码模式下计算每批数据的成本
-def rollout(mat, model, dataset, opts):
+def rollout(model, dataset, opts):
     # Put in greedy evaluation mode!
     set_decode_type(model, "greedy")
     model.eval()
 
     def eval_model_bat(bat):
         with torch.no_grad():
-            cost, _, _ = model(mat, move_to(bat, opts.device))
+            cost, _, _ = model(move_to(bat, opts.device))
         return cost.data.cpu()
 
     return torch.cat([
         eval_model_bat(bat)
         for bat in DataLoader(dataset, batch_size=opts.eval_batch_size)
     ], 0)
-def roll(mat, model, dataset, opts):
+def roll(model, dataset, opts):
     # Put in greedy evaluation mode!
     set_decode_type(model, "greedy")
     model.eval()
@@ -157,7 +71,7 @@ def roll(mat, model, dataset, opts):
     p = []
     def eval_model_bat(bat):
         with torch.no_grad():
-            cost, _, pi = model(mat, move_to(bat, opts.device))
+            cost, _, pi = model(move_to(bat, opts.device))
         return cost.data.cpu(), pi.data.cpu()
     
     for bat in DataLoader(dataset, batch_size=opts.eval_batch_size):
@@ -202,27 +116,32 @@ def log_values(cost, grad_norms, epoch, batch_id, step,
 
 class TSPDataset(Dataset):
     # AI: 构建出了包含城市坐标信息、访问顺序等相关数据的数据集对象
-    def __init__(self, ci, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
+    def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
         super(TSPDataset, self).__init__()
 
-        self.data_set = []
-        l = torch.rand((num_samples, ci.n_cities - 1)) # 随机生成城市坐标
-        _, ind = torch.sort(l)
-        ind = ind.to(device)
-        ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
-        ind = ind[:,:size,:] + 1
-        ff = ci.cities.unsqueeze(0)
-        ff = ff.expand(num_samples, ci.n_cities, 2) # 此时ff中有num_samples个城市坐标(ci.cities)
-        f = torch.gather(ff, dim = 1, index = ind)
-        f = f.permute(0,2,1) # 把形状(1000, 19, 2) 调为 (1000,2,19)
-        depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1) # 看到这块，我感觉应该得结合论文的第四部分的Part A看
-        self.static = torch.cat((depot, f), dim = 2)
-        depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
-        ind = ind[:,:,0:1]
-        ind = torch.cat((depot, ind), dim=1)
-        self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
-        self.data = self.data.scatter_(2, ind, 1.)
+        # self.data_set = []
+        # l = torch.rand((num_samples, ci.n_cities - 1)) # 随机生成城市坐标
+        # _, ind = torch.sort(l)
+        # ind = ind.to(device)
+        # ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
+        # ind = ind[:,:size,:] + 1
+        # ff = ci.cities.unsqueeze(0)
+        # ff = ff.expand(num_samples, ci.n_cities, 2) # 此时ff中有num_samples个城市坐标(ci.cities)
+        # f = torch.gather(ff, dim = 1, index = ind)
+        # f = f.permute(0,2,1) # 把形状(1000, 19, 2) 调为 (1000,2,19)
+        # depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1) # 看到这块，我感觉应该得结合论文的第四部分的Part A看
+        # self.static = torch.cat((depot, f), dim = 2)
+        # depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
+        # ind = ind[:,:,0:1]
+        # ind = torch.cat((depot, ind), dim=1)
+        # self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
+        # self.data = self.data.scatter_(2, ind, 1.)
+        # self.size = len(self.data)
+        data = [torch.FloatTensor(size, 2).uniform_(0, 1) for _ in range(num_samples)]
+        self.data = torch.stack(data, dim=0).to(device)
+
         self.size = len(self.data)
+
     def __len__(self):
         return self.size
 
@@ -251,10 +170,10 @@ def clip_grad_norms(param_groups, max_norm=math.inf):
     return grad_norms, grad_norms_clipped
 
 
-def validate(mat, model, dataset, opts):
+def validate(model, dataset, opts):
     # Validate
     print('Validating...')
-    cost = rollout(mat, model, dataset, opts)
+    cost = rollout(model, dataset, opts)
     avg_cost = cost.mean()
     print('Validation overall avg_cost: {} +- {}'.format(
         avg_cost, torch.std(cost) / math.sqrt(len(cost))))
@@ -263,7 +182,6 @@ def validate(mat, model, dataset, opts):
 
 
 def train_batch(
-        mat,
         model,
         optimizer,
         baseline,
@@ -280,7 +198,7 @@ def train_batch(
     bl_val = move_to(bl_val, opts.device) if bl_val is not None else None
 
     # 前向传播计算成本和对数似然
-    cost, log_likelihood,_ = model(mat, x)
+    cost, log_likelihood,_ = model(x)
 
     # Evaluate baseline, get baseline loss if any (only for critic)
     bl_val, bl_loss = baseline.eval(x, cost) if bl_val is None else (bl_val, 0)
@@ -302,7 +220,7 @@ def train_batch(
         log_values(cost, grad_norms, epoch, batch_id, step,
                    log_likelihood, reinforce_loss, bl_loss, tb_logger, opts)
 
-def train_epoch(mat, ci, model, optimizer, baseline, lr_scheduler, epoch, val_dataset, tb_logger, opts):
+def train_epoch(model, optimizer, baseline, lr_scheduler, epoch, val_dataset, tb_logger, opts):
     print("Start train epoch {}, lr={} for run {}".format(epoch, optimizer.param_groups[0]['lr'], opts.run_name))
     step = epoch * (opts.epoch_size // opts.batch_size)
     start_time = time.time()
@@ -313,7 +231,7 @@ def train_epoch(mat, ci, model, optimizer, baseline, lr_scheduler, epoch, val_da
 
     # Generate new training data for each epoch
     # 每一个epoch都会生成不同的dataset进行训练
-    training_dataset = baseline.wrap_dataset(TSPDataset(ci, size=opts.graph_size, num_samples=opts.epoch_size))
+    training_dataset = baseline.wrap_dataset(TSPDataset(size=opts.graph_size, num_samples=opts.epoch_size))
     training_dataloader = DataLoader(training_dataset, batch_size=opts.batch_size)
 
     # Put model in train mode!
@@ -323,7 +241,6 @@ def train_epoch(mat, ci, model, optimizer, baseline, lr_scheduler, epoch, val_da
     for batch_id, batch in enumerate(training_dataloader):
         # 处理每个批次的训练
         train_batch(
-            mat,
             model,
             optimizer,
             baseline,
@@ -353,7 +270,7 @@ def train_epoch(mat, ci, model, optimizer, baseline, lr_scheduler, epoch, val_da
             os.path.join(opts.save_dir, 'epoch-{}.pt'.format(epoch))
         )
     # 验证平均回报有效性
-    avg_reward = validate(mat, model, val_dataset, opts)
+    avg_reward = validate(model, val_dataset, opts)
 
     if not opts.no_tensorboard:
         tb_logger.log_value('val_avg_reward', avg_reward, step)
@@ -400,12 +317,12 @@ def run(opts):
         print('  [*] Loading data from {}'.format(load_path))
         load_data = torch_load_cpu(load_path)
     # 初始化距离向量，城市默认100个节点
-    ci = Cities()
+    # ci = Cities()
     # mat包含了ci，这一步之后，才把data.csv数据读入，并且分为12个时间段
     # 并且在该模型中，距离是用时间来进行评估的，生成距离向量中采用三次样条插值
     # 的目的在于得到估计的旅行时间函数f_i_j(t)
     # mat = DistanceMatrix(ci, load_dir='./data.csv', max_time_step = 12)
-    mat = DistanceMatrix(ci)
+    # mat = DistanceMatrix(ci)
     # np.savetxt('var.txt', mat.var.cpu().numpy(), fmt='%.6f')
     # np.savetxt('mat.txt', mat.mat.cpu().numpy(), fmt='%.6f')
     # np.savetxt('m2.txt', mat.m2.cpu().numpy(), fmt='%.6f')
@@ -425,7 +342,7 @@ def run(opts):
         tanh_clipping=opts.tanh_clipping,   # tanh裁剪值
         checkpoint_encoder=opts.checkpoint_encoder, # 编码器检查点
         shrink_size=opts.shrink_size,   # 放缩大小
-        input_size=opts.graph_size+1,   # 输入大小
+        input_size=opts.graph_size,   # 输入大小
         max_t=12,    # 最大时间步长
         beam_width=opts.beam_width,
         max_seq_len=20
@@ -443,7 +360,8 @@ def run(opts):
         baseline = ExponentialBaseline(opts.exp_beta) #指数基线
     
     elif opts.baseline == 'rollout':
-        baseline = RolloutBaseline(mat, ci, model, opts) # Rollout基线，Rollout貌似都是使用greedy策略
+        # baseline = RolloutBaseline(mat, ci, model, opts) # Rollout基线，Rollout貌似都是使用greedy策略
+        baseline = RolloutBaseline(model, opts)
     else:
         assert opts.baseline is None, "Unknown baseline: {}".format(opts.baseline)
         baseline = NoBaseline()
@@ -480,10 +398,9 @@ def run(opts):
     # 初始化学习率调度器，根据每个epoch对学习率进行衰减。另外创建验证数据集，数据集大小由图的大小和样本数量决定
     lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: opts.lr_decay ** epoch)
     # Start the actual training loop
-    val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, filename=opts.val_dataset, distribution=opts.data_distribution)
+    val_dataset = TSPDataset(size=opts.graph_size, num_samples=opts.val_size, filename=opts.val_dataset, distribution=opts.data_distribution)
 
-    _,ind = torch.max(val_dataset.data, dim=2)
-    np.savetxt('valid_data.txt', ind.cpu().numpy(), fmt='%d')
+    np.savetxt('valid_data.txt', val_dataset.data.reshape(-1, 2).cpu().numpy(), fmt='%f')
     # 继续上次训练没完成的模型
     if opts.resume:
         epoch_resume = int(os.path.splitext(os.path.split(opts.resume)[-1])[0].split("-")[1])
@@ -500,13 +417,11 @@ def run(opts):
     # 初始化和有些参数的保存到此处结束，下面是正式开始
     if opts.eval_only:
         # 只评估
-        validate(mat, model, val_dataset, opts)
+        validate(model, val_dataset, opts)
     else:
         for epoch in range(opts.epoch_start, opts.epoch_start + opts.n_epochs):
             # 模型训练方法
             train_epoch(
-                mat, # 距离矩阵
-                ci, # 城市对象
                 model,  # 模型
                 optimizer,  # 优化器
                 baseline,   # 基线
@@ -518,8 +433,8 @@ def run(opts):
             )
     # 得出最终算法，并且给出成本
     model2 = baseline.baseline.model
-    ans, cost = roll(mat, model2, val_dataset, opts)
-    print('Avg cost:', torch.mean(cost)*1440)
+    ans, cost = roll(model2, val_dataset, opts)
+    print('Avg cost:', torch.mean(cost))
     np.savetxt('answer.txt', ans.cpu().numpy(), fmt='%d')
     np.savetxt('costs.txt', cost.cpu().numpy(), fmt='%.6f')
 if __name__ == "__main__":

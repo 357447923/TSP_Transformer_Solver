@@ -286,12 +286,13 @@ def generate_positional_encoding(d_model, max_len):
     return pe
 
 def get_costs(dataset, pi, state, mat):
-    depots = torch.zeros(pi.size(0), 1).long().to(device)
-    _,ind = torch.max(dataset, dim=2)
+    # depots = torch.zeros(pi.size(0), 1).long().to(device)
+    # _,ind = torch.max(dataset, dim=2)
     # bdd = mat.var[state.prev_a.squeeze() * mat.n_c].unsqueeze(1)
     # bdd = torch.randn(state.prev_a.size(0), device=device) * bdd
     # add = mat.__getd__(ind, state.prev_a, depots, state.lengths).unsqueeze(1)
-    add = mat.__getd__(ind, state.prev_a, depots).unsqueeze(1)
+    ind = torch.arange(0, dataset.size(1) - 1).repeat(dataset.size(0), 1, 1)
+    add = mat.__getd__(ind, state.prev_a, state.first_a).unsqueeze(1)
     # bdd = bdd.repeat(1, 2)
     # bdd[:,1] = add.squeeze() * 5
     # bdd = torch.min(bdd, dim=1)[0]
@@ -300,6 +301,16 @@ def get_costs(dataset, pi, state, mat):
     # bdd = torch.max(bdd, dim=1)[0]
     # return state.lengths.squeeze() + add.squeeze() + bdd.squeeze(), None
     return state.lengths.squeeze() + add.squeeze(), None
+    # assert (
+    #         torch.arange(pi.size(1), out=pi.data.new()).view(1, -1).expand_as(pi) ==
+    #         pi.data.sort(1)[0]
+    # ).all(), "Invalid tour"
+    #
+    # # Gather dataset in order of tour
+    # d = dataset.gather(1, pi.unsqueeze(-1).expand_as(dataset))
+    #
+    # # Length is distance (L2-norm of difference) from each next location from its prev and of last from first
+    # return (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1) + (d[:, 0] - d[:, -1]).norm(p=2, dim=1), None
 
 class StateTSP(NamedTuple):
     # Fixed input
@@ -375,11 +386,20 @@ class StateTSP(NamedTuple):
     def update(self, selected, mat, input):
 
         # Update the state
-        next_node = selected[:, None]  # Add dimension for step
-        _,ind = torch.max(input, dim=2)
+        prev_a = selected[:, None]  # Add dimension for step
+        # ind = torch.arange(0, input.size(1) - 1).repeat(input.size(0), 1, 1)
+
         # bdd = mat.var[self.prev_a.squeeze() * mat.n_c + next_node.squeeze()].unsqueeze(1)
         # add = mat.__getd__(ind, self.prev_a, next_node, self.lengths).unsqueeze(1)
-        add = mat.__getd__(ind, self.prev_a, next_node).reshape(-1, 1)
+        # first_a = prev_a if self.i.item() == 0 else self.first_a
+        # add = mat.__getd__(ind, self.prev_a, prev_a).reshape(-1, 1)
+        cur_coord = self.loc[self.ids, prev_a]
+        lengths = self.lengths
+        if self.cur_coord is not None:  # Don't add length for first action (selection of start node)
+            lengths = self.lengths + (cur_coord - self.cur_coord).norm(p=2, dim=-1)  # (batch_dim, 1)
+
+        # Update should only be called with just 1 parallel step, in which case we can check this way if we should update
+        first_a = prev_a if self.i.item() == 0 else self.first_a
         # bdd = torch.randn(next_node.size(0), 1, device=device) * bdd
         # bdd = bdd.repeat(1, 2)
         # bdd[:, 1] = add.squeeze() * 5 # UB
@@ -388,14 +408,15 @@ class StateTSP(NamedTuple):
         # bdd[:, 1] = add.squeeze() * -0.9 # LB
         # bdd = torch.max(bdd, dim=1)[0]
         # lengths = self.lengths + add + bdd[:, None]
-        lengths = self.lengths + add
-        visited_ = self.visited_.scatter(-1, next_node[:, :, None], 1)
+        # lengths = self.lengths + add
+        visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1)
 
-        return self._replace(prev_a=next_node, visited_=visited_, lengths=lengths, i=self.i + 1)
+        return self._replace(first_a=first_a, prev_a=prev_a, visited_=visited_, lengths=lengths,
+                             cur_coord=cur_coord, i=self.i + 1)
 
     def all_finished(self):
         # Exactly n steps
-        return self.i.item() >= self.loc.size(-2) - 1
+        return self.i.item() >= self.loc.size(-2)
 
     def get_current_node(self):
         return self.prev_a
@@ -425,6 +446,31 @@ class AttentionModelFixed(NamedTuple):
             )
         return super(AttentionModelFixed, self).__getitem__(key)
 
+class DistanceMatrix:
+    # DistanceMatrix类用于模拟城市间，并实现基于时间变化的距离矩阵
+    # def __init__(self, ci, max_time_step = 100, load_dir = None):
+    def __init__(self, ci):
+        self.cities = ci
+        self.cities_distance = torch.cdist(self.cities, self.cities).to(device)
+    # 与getddd 都用于获取在某一特定时间t下，由状态向量st中指定的城市a和b的距离估计
+    # 但getd针对单个时间点和一对城市计算距离，而getddd是批量处理计算
+    def __getd__(self, st, a, b):
+        # a = torch.gather(st, 1, a)
+        # b = torch.gather(st, 1, b)
+        cities = self.cities.repeat(st.size(0), 1, 1)
+        city_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
+        city_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
+        res = torch.cdist(city_a, city_b) # 计算二维欧氏距离
+        return res
+    def __getddd__(self, st, a, b):
+        s0, s1 = a.size(0), a.size(1) * b.size(1)
+        a = torch.gather(st, 1, a)
+        b = torch.gather(st, 1, b)
+        cities = self.cities.repeat(st.size(0), 1, 1).to(st.device)
+        cities_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
+        cities_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
+        res = torch.cdist(cities_a, cities_b)
+        return res.view(s0, s1)
 
 class AttentionModel(nn.Module):
     def __init__(self,
@@ -440,6 +486,7 @@ class AttentionModel(nn.Module):
                  shrink_size=None,
                  input_size=4,
                  max_t=12,
+                 graph_size=20,
                  beam_width=2,
                  max_seq_len=20):
         
@@ -448,7 +495,6 @@ class AttentionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_encode_layers = n_encode_layers
         self.decode_type = None
-        # self.test_decode_type = "greedy" # TODO 不需要的时候记得删
         self.beam_width = beam_width
         self.temp = 1.0
         self.tanh_clipping = tanh_clipping
@@ -456,9 +502,9 @@ class AttentionModel(nn.Module):
         self.mask_logits = mask_logits
         self.n_heads = n_heads
         step_context_dim = 4 * embedding_dim  # Embedding of first and last node
-        node_dim = 100
-        # nn.Parameter()是pytorch用来标记某个张量是可训练参数的包装类
-        self.W_placeholder = nn.Parameter(torch.Tensor(2 * embedding_dim))
+        # node_dim = 100
+        node_dim = 2
+        self.W_placeholder = nn.Parameter(torch.Tensor(4 * embedding_dim))
         # 作用是生成服从-1到1的服从均匀分布的随机数
         self.W_placeholder.data.uniform_(-1, 1)  # Placeholder should be in range of activations
         # 定义了应该全连接层，作用是将100维的数据转成128维
@@ -477,7 +523,7 @@ class AttentionModel(nn.Module):
         self.project_fixed_context = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.project_step_context = nn.Linear(step_context_dim, embedding_dim, bias=False)
         # self.embed_static_traffic = nn.Linear(node_dim * max_t, embedding_dim)
-        self.embed_static_traffic = nn.Linear(node_dim, embedding_dim)
+        self.embed_static_traffic = nn.Linear(input_size, embedding_dim)
         self.embed_static = nn.Linear(2 * embedding_dim, embedding_dim)
         assert embedding_dim % n_heads == 0
         # Note n_heads * val_dim == embedding_dim so input to project_out is embedding_dim
@@ -496,7 +542,7 @@ class AttentionModel(nn.Module):
         if temp is not None:  # Do not change temperature if not provided
             self.temp = temp
     
-    def forward(self, mat, input, return_pi=False):
+    def forward(self, input, return_pi=False):
         """
         :param input: (batch_size, graph_size, node_dim) input node features or dictionary with multiple tensors
         :param return_pi: whether to return the output sequences, this is optional as it is not compatible with
@@ -506,12 +552,14 @@ class AttentionModel(nn.Module):
         # Linear层 in: 100 out: 128 bias: True
         x = self._init_embed(input) # 将每个客户节点i转换为ID嵌入x_i
         # z = mat.mat.reshape(1, 100, 1200).repeat(input.size(0), 1, 1) # 将100个节点不同时间段的距离（时间距离）扩展为input的batch_size，方便使用
-        _, ind = torch.max(input, dim=2)
-        z = mat.cities_distance.reshape(1, 100, 100).repeat(input.size(0), 1, 1)
-        tr = z.gather(1, ind.view(input.size(0), -1, 1).expand(input.size(0), input.size(1), 100)) # 应该是获取当前批次要访问的节点在各个时间的时间距离
-        y = self.embed_static_traffic(tr) # 将估计的流量状况(mat)转化为流量嵌入y_i  # TODO 论文指出在DPDP数据集中还嵌入了运输量q，但我还没发现相关代码
+        # _, ind = torch.max(input, dim=2) 注释掉是因为修改数据集后，input本身就是城市坐标了
+        mat = DistanceMatrix(input)
+        # z = mat.cities_distance.reshape(1, 100, 100).repeat(input.size(0), 1, 1)
+        # tr = z.gather(1, ind.view(input.size(0), -1, 1).expand(input.size(0), input.size(1), 100)) # 应该是获取当前批次要访问的节点在各个时间的时间距离
+        y = self.embed_static_traffic(mat.cities_distance) # 将估计的流量状况(mat)转化为流量嵌入y_i  # TODO 论文指出在DPDP数据集中还嵌入了运输量q，但我还没发现相关代码
         # 编码器执行，输出每个节点的特以及整个图
         embeddings, _ = self.embedder(self.embed_static(torch.cat((x, y), dim = 2))) # 将x和y连接起来，产生{h^(0)_0},并且作为图注意力编码器的前向传播的输入
+        # embeddings, _ = self.embedder(x)
         self.embeddings = embeddings # embeddings为h_i, embedder前向传播返回值中的h_i的平均值被忽略
         # 解码器运行，log_p就是论文中解码器的输出p(每一个下一步的所有可能的概率)， pi是访问序列，state是论文中Fig.1中的state
         _log_p, pi, state = self._inner(input, embeddings, mat)
@@ -605,8 +653,7 @@ class AttentionModel(nn.Module):
         outputs = []
         sequences = []
         state = StateTSP.initialize(input)
-        state = state.addmask() # mask用于记录是否已经访问
-
+        # state = state.addmask()   # TSP问题不一定从0点开始
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
         # Perform decoding steps 执行解码步骤
         fixed = self._precompute(embeddings)
@@ -775,9 +822,20 @@ class AttentionModel(nn.Module):
         :return: (batch_size, num_steps, context_dim)
         """
         b_s, i_s = embeddings.size(0), embeddings.size(1)
-        _, ind = torch.max(input, dim=2)
+        current_node = state.get_current_node()
+        if state.i.item() == 0:
+            # First and only step, ignore prev_a (this is a placeholder)
+            return self.W_placeholder[None, None, :].expand(b_s, 1, self.W_placeholder.size(-1))
+        # else:
+        #     return embeddings.gather(
+        #         1,
+        #         torch.cat((state.first_a, current_node), 1)[:, :, None].expand(b_s, 2, embeddings.size(-1))
+        #     ).view(b_s, 1, -1)
+
+        # ind = torch.arange(0, i_s - 1).repeat(b_s, 1, 1)
         # current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1, 1).view(b_s, i_s*i_s), self.yy.repeat(b_s, 1, 1).view(b_s, i_s*i_s), state.lengths).view(b_s, 1, i_s*i_s))
-        current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1).view(b_s, i_s), self.yy.repeat(b_s, 1).view(b_s, i_s)).view(b_s, 1, i_s * i_s))
+        # current_traffic = self.project_traffic(mat.__getddd__(ind, self.xx.repeat(b_s, 1).view(b_s, i_s), self.yy.repeat(b_s, 1).view(b_s, i_s)).view(b_s, 1, i_s * i_s))
+        current_traffic = self.project_traffic(mat.cities_distance.view(b_s, 1, i_s * i_s))
         current_visit = self.project_visit(state.visited_.float())
         ss = embeddings.gather(1, torch.cat((state.first_a, state.prev_a), 1)[:, :, None].expand(b_s, 2, embeddings.size(-1)))
         return torch.cat((ss.view(b_s, 1, -1), current_traffic, current_visit), dim=2)
