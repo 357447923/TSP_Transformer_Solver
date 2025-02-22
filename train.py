@@ -336,16 +336,13 @@ def run(opts):
         opts.embedding_dim, # 嵌入维度
         opts.hidden_dim,    # 隐藏层维度
         n_encode_layers=opts.n_encode_layers,   # 编码器层数
+        n_decode_layers=opts.n_decode_layers,
         mask_inner=True,    # 内部掩码
         mask_logits=True,   # Logits掩码
         normalization=opts.normalization,   # 归一化方法
         tanh_clipping=opts.tanh_clipping,   # tanh裁剪值
-        checkpoint_encoder=opts.checkpoint_encoder, # 编码器检查点
-        shrink_size=opts.shrink_size,   # 放缩大小
-        input_size=opts.graph_size,   # 输入大小
-        max_t=12,    # 最大时间步长
         beam_width=opts.beam_width,
-        max_seq_len=20
+        max_len_pe=1000
     ).to(opts.device)
 
     # Overwrite model parameters by parameters to load

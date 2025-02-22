@@ -9,6 +9,7 @@ import math
 from typing import NamedTuple
 import warnings
 
+from torch.distributions import Categorical
 from torch.onnx.symbolic_opset9 import tensor
 from torch.onnx.utils import attr_pattern
 
@@ -200,16 +201,7 @@ class MultiHeadAttentionLayer(nn.Sequential):
             feed_forward_hidden=512,
             normalization='batch',
     ):
-        # print("MultiHeadAttentionLayer: n_heads:")
-        # print(n_heads)
-        # print(", embed_dim:")
-        # print(embed_dim)
-        # print(", feed_forward_hidden:")
-        # print(feed_forward_hidden)
-        # print(", normalization:")
-        # print(normalization)
         super(MultiHeadAttentionLayer, self).__init__(
-            # 结合a) Formulations
             SkipConnection( # 论文中提到的MHA子层
                 MultiHeadAttention(
                     n_heads,
@@ -268,6 +260,146 @@ class GraphAttentionEncoder(nn.Module):
         )
 
 
+def myMHA(Q, K, V, nb_heads, mask=None, clip_value=None):
+    """
+    Compute multi-head attention (MHA) given a query Q, key K, value V and attention mask :
+      h = Concat_{k=1}^nb_heads softmax(Q_k^T.K_k).V_k
+    Note : We did not use nn.MultiheadAttention to avoid re-computing all linear transformations at each call.
+    Inputs : Q of size (bsz, dim_emb, 1)                batch of queries
+             K of size (bsz, dim_emb, nb_nodes+1)       batch of keys
+             V of size (bsz, dim_emb, nb_nodes+1)       batch of values
+             mask of size (bsz, nb_nodes+1)             batch of masks of visited cities
+             clip_value is a scalar
+    Outputs : attn_output of size (bsz, 1, dim_emb)     batch of attention vectors
+              attn_weights of size (bsz, 1, nb_nodes+1) batch of attention weights
+    """
+    bsz, nb_nodes, emd_dim = K.size()  # dim_emb must be divisable by nb_heads
+    if nb_heads > 1:
+        # PyTorch view requires contiguous dimensions for correct reshaping
+        Q = Q.transpose(1, 2).contiguous()  # size(Q)=(bsz, dim_emb, 1)
+        Q = Q.view(bsz * nb_heads, emd_dim // nb_heads, 1)  # size(Q)=(bsz*nb_heads, dim_emb//nb_heads, 1)
+        Q = Q.transpose(1, 2).contiguous()  # size(Q)=(bsz*nb_heads, 1, dim_emb//nb_heads)
+        K = K.transpose(1, 2).contiguous()  # size(K)=(bsz, dim_emb, nb_nodes+1)
+        K = K.view(bsz * nb_heads, emd_dim // nb_heads,
+                   nb_nodes)  # size(K)=(bsz*nb_heads, dim_emb//nb_heads, nb_nodes+1)
+        K = K.transpose(1, 2).contiguous()  # size(K)=(bsz*nb_heads, nb_nodes+1, dim_emb//nb_heads)
+        V = V.transpose(1, 2).contiguous()  # size(V)=(bsz, dim_emb, nb_nodes+1)
+        V = V.view(bsz * nb_heads, emd_dim // nb_heads,
+                   nb_nodes)  # size(V)=(bsz*nb_heads, dim_emb//nb_heads, nb_nodes+1)
+        V = V.transpose(1, 2).contiguous()  # size(V)=(bsz*nb_heads, nb_nodes+1, dim_emb//nb_heads)
+    attn_weights = torch.bmm(Q, K.transpose(1, 2)) / Q.size(
+        -1) ** 0.5  # size(attn_weights)=(bsz*nb_heads, 1, nb_nodes+1)
+    if clip_value is not None:
+        attn_weights = clip_value * torch.tanh(attn_weights)
+    if mask is not None:
+        if nb_heads > 1:
+            mask = torch.repeat_interleave(mask, repeats=nb_heads, dim=0)  # size(mask)=(bsz*nb_heads, nb_nodes+1)
+        # attn_weights = attn_weights.masked_fill(mask.unsqueeze(1), float('-inf')) # size(attn_weights)=(bsz*nb_heads, 1, nb_nodes+1)
+        attn_weights = attn_weights.masked_fill(mask.unsqueeze(1),
+                                                float('-1e9'))  # size(attn_weights)=(bsz*nb_heads, 1, nb_nodes+1)
+    attn_weights = torch.softmax(attn_weights, dim=-1)  # size(attn_weights)=(bsz*nb_heads, 1, nb_nodes+1)
+    attn_output = torch.bmm(attn_weights, V)  # size(attn_output)=(bsz*nb_heads, 1, dim_emb//nb_heads)
+    if nb_heads > 1:
+        attn_output = attn_output.transpose(1, 2).contiguous()  # size(attn_output)=(bsz*nb_heads, dim_emb//nb_heads, 1)
+        attn_output = attn_output.view(bsz, emd_dim, 1)  # size(attn_output)=(bsz, dim_emb, 1)
+        attn_output = attn_output.transpose(1, 2).contiguous()  # size(attn_output)=(bsz, 1, dim_emb)
+        attn_weights = attn_weights.view(bsz, nb_heads, 1,
+                                         nb_nodes)  # size(attn_weights)=(bsz, nb_heads, 1, nb_nodes+1)
+        attn_weights = attn_weights.mean(dim=1)  # mean over the heads, size(attn_weights)=(bsz, 1, nb_nodes+1)
+    return attn_output, attn_weights
+
+
+class AutoRegressiveDecoderLayer(nn.Module):
+    """
+    Single decoder layer based on self-attention and query-attention
+    Inputs :
+      h_t of size      (bsz, 1, dim_emb)          batch of input queries
+      K_att of size    (bsz, nb_nodes+1, dim_emb) batch of query-attention keys
+      V_att of size    (bsz, nb_nodes+1, dim_emb) batch of query-attention values
+      mask of size     (bsz, nb_nodes+1)          batch of masks of visited cities
+    Output :
+      h_t of size (bsz, nb_nodes+1)               batch of transformed queries
+    """
+
+    def __init__(self, dim_emb, nb_heads):
+        super(AutoRegressiveDecoderLayer, self).__init__()
+        self.dim_emb = dim_emb
+        self.nb_heads = nb_heads
+        self.Wq_selfatt = nn.Linear(dim_emb, dim_emb)
+        self.Wk_selfatt = nn.Linear(dim_emb, dim_emb)
+        self.Wv_selfatt = nn.Linear(dim_emb, dim_emb)
+        self.W0_selfatt = nn.Linear(dim_emb, dim_emb)
+        self.W0_att = nn.Linear(dim_emb, dim_emb)
+        self.Wq_att = nn.Linear(dim_emb, dim_emb)
+        self.W1_MLP = nn.Linear(dim_emb, dim_emb)
+        self.W2_MLP = nn.Linear(dim_emb, dim_emb)
+        self.BN_selfatt = nn.LayerNorm(dim_emb)
+        self.BN_att = nn.LayerNorm(dim_emb)
+        self.BN_MLP = nn.LayerNorm(dim_emb)
+        self.K_sa = None
+        self.V_sa = None
+
+    def reset_selfatt_keys_values(self):
+        self.K_sa = None
+        self.V_sa = None
+
+    def forward(self, h_t, K_att, V_att, mask):
+        bsz = h_t.size(0)
+        h_t = h_t.view(bsz, 1, self.dim_emb)  # size(h_t)=(bsz, 1, dim_emb)
+        # embed the query for self-attention
+        q_sa = self.Wq_selfatt(h_t)  # size(q_sa)=(bsz, 1, dim_emb)
+        k_sa = self.Wk_selfatt(h_t)  # size(k_sa)=(bsz, 1, dim_emb)
+        v_sa = self.Wv_selfatt(h_t)  # size(v_sa)=(bsz, 1, dim_emb)
+        # concatenate the new self-attention key and value to the previous keys and values
+        if self.K_sa is None:
+            self.K_sa = k_sa  # size(self.K_sa)=(bsz, 1, dim_emb)
+            self.V_sa = v_sa  # size(self.V_sa)=(bsz, 1, dim_emb)
+        else:
+            self.K_sa = torch.cat([self.K_sa, k_sa], dim=1)
+            self.V_sa = torch.cat([self.V_sa, v_sa], dim=1)
+        # compute self-attention between nodes in the partial tour
+        h_t = h_t + self.W0_selfatt(myMHA(q_sa, self.K_sa, self.V_sa, self.nb_heads)[0])  # size(h_t)=(bsz, 1, dim_emb)
+        h_t = self.BN_selfatt(h_t.squeeze())  # size(h_t)=(bsz, dim_emb)
+        h_t = h_t.view(bsz, 1, self.dim_emb)  # size(h_t)=(bsz, 1, dim_emb)
+        # compute attention between self-attention nodes and encoding nodes in the partial tour (translation process)
+        q_a = self.Wq_att(h_t)  # size(q_a)=(bsz, 1, dim_emb)
+        h_t = h_t + self.W0_att(myMHA(q_a, K_att, V_att, self.nb_heads, mask)[0])  # size(h_t)=(bsz, 1, dim_emb)
+        h_t = self.BN_att(h_t.squeeze())  # size(h_t)=(bsz, dim_emb)
+        h_t = h_t.view(bsz, 1, self.dim_emb)  # size(h_t)=(bsz, 1, dim_emb)
+        # MLP
+        h_t = h_t + self.W2_MLP(torch.relu(self.W1_MLP(h_t)))
+        h_t = self.BN_MLP(h_t.squeeze(1))  # size(h_t)=(bsz, dim_emb)
+        return h_t
+
+class GraphAttentionDecoder(nn.Module):
+    def __init__(self, embedding_dim, n_heads, n_decode_layers):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.n_heads = n_heads
+        self.n_decode_layers = n_decode_layers
+        self.decoder_layers = nn.ModuleList(
+            [AutoRegressiveDecoderLayer(embedding_dim, n_heads) for _ in range(n_decode_layers - 1)])
+        self.Wq_final = nn.Linear(embedding_dim, embedding_dim)
+
+    def reset_self_att_keys_values(self):
+        for l in range(self.n_decode_layers - 1):
+            self.decoder_layers[l].reset_selfatt_keys_values()
+
+    def forward(self, h_t, K_att, V_att, mask):
+        for l in range(self.n_decode_layers):
+            K_att_l = K_att[:, :,
+                      l * self.embedding_dim:(l + 1) * self.embedding_dim].contiguous()  # size(K_att_l)=(bsz, nb_nodes+1, dim_emb)
+            V_att_l = V_att[:, :,
+                      l * self.embedding_dim:(l + 1) * self.embedding_dim].contiguous()  # size(V_att_l)=(bsz, nb_nodes+1, dim_emb)
+            if l < self.n_decode_layers - 1:  # decoder layers with multiple heads (intermediate layers)
+                h_t = self.decoder_layers[l](h_t, K_att_l, V_att_l, mask)
+            else:  # decoder layers with single head (final layer)
+                q_final = self.Wq_final(h_t)
+                bsz = h_t.size(0)
+                q_final = q_final.view(bsz, 1, self.embedding_dim)
+                attn_weights = myMHA(q_final, K_att_l, V_att_l, 1, mask, 10)[1]
+        prob_next_node = attn_weights.squeeze(1)
+        return prob_next_node
 
 def generate_positional_encoding(d_model, max_len):
     """
@@ -285,22 +417,20 @@ def generate_positional_encoding(d_model, max_len):
     pe[:,1::2] = torch.cos(position * div_term)
     return pe
 
-def get_costs(dataset, pi, state, mat):
-    # depots = torch.zeros(pi.size(0), 1).long().to(device)
-    # _,ind = torch.max(dataset, dim=2)
-    # bdd = mat.var[state.prev_a.squeeze() * mat.n_c].unsqueeze(1)
-    # bdd = torch.randn(state.prev_a.size(0), device=device) * bdd
-    # add = mat.__getd__(ind, state.prev_a, depots, state.lengths).unsqueeze(1)
-    ind = torch.arange(0, dataset.size(1) - 1).repeat(dataset.size(0), 1, 1)
-    add = mat.__getd__(ind, state.prev_a, state.first_a).unsqueeze(1)
-    # bdd = bdd.repeat(1, 2)
-    # bdd[:,1] = add.squeeze() * 5
-    # bdd = torch.min(bdd, dim=1)[0]
-    # bdd = bdd[:, None].repeat(1, 2)
-    # bdd[:,1] = add.squeeze() * -0.9
-    # bdd = torch.max(bdd, dim=1)[0]
-    # return state.lengths.squeeze() + add.squeeze() + bdd.squeeze(), None
-    return state.lengths.squeeze() + add.squeeze(), None
+def get_costs(dataset, pi):
+    bsz = dataset.size(0)
+    nb_nodes = dataset.size(1)
+    arange_vec = torch.arange(bsz, device=dataset.device)
+    first_cities = dataset[arange_vec, pi[:, 0], :]  # size(first_cities)=(bsz,2)
+    previous_cities = first_cities
+    cost = torch.zeros(bsz, device=dataset.device)
+    with torch.no_grad():
+        for i in range(1, nb_nodes):
+            current_cities = dataset[arange_vec, pi[:, i], :]
+            cost += torch.sum((current_cities - previous_cities) ** 2, dim=1) ** 0.5  # dist(current, previous node)
+            previous_cities = current_cities
+        cost += torch.sum((current_cities - first_cities) ** 2, dim=1) ** 0.5  # dist(last, first node)
+    return cost, None
     # assert (
     #         torch.arange(pi.size(1), out=pi.data.new()).view(1, -1).expand_as(pi) ==
     #         pi.data.sort(1)[0]
@@ -400,15 +530,6 @@ class StateTSP(NamedTuple):
 
         # Update should only be called with just 1 parallel step, in which case we can check this way if we should update
         first_a = prev_a if self.i.item() == 0 else self.first_a
-        # bdd = torch.randn(next_node.size(0), 1, device=device) * bdd
-        # bdd = bdd.repeat(1, 2)
-        # bdd[:, 1] = add.squeeze() * 5 # UB
-        # bdd = torch.min(bdd, dim=1)[0]
-        # bdd = bdd[:, None].repeat(1, 2)
-        # bdd[:, 1] = add.squeeze() * -0.9 # LB
-        # bdd = torch.max(bdd, dim=1)[0]
-        # lengths = self.lengths + add + bdd[:, None]
-        # lengths = self.lengths + add
         visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1)
 
         return self._replace(first_a=first_a, prev_a=prev_a, visited_=visited_, lengths=lengths,
@@ -472,28 +593,27 @@ class DistanceMatrix:
         res = torch.cdist(cities_a, cities_b)
         return res.view(s0, s1)
 
+
+
 class AttentionModel(nn.Module):
     def __init__(self,
                  embedding_dim,
                  hidden_dim,
                  n_encode_layers=2,
+                 n_decode_layers=2,
                  tanh_clipping=10.,
                  mask_inner=True,
                  mask_logits=True,
                  normalization='batch',
                  n_heads=8,
-                 checkpoint_encoder=False,
-                 shrink_size=None,
-                 input_size=4,
-                 max_t=12,
-                 graph_size=20,
                  beam_width=2,
-                 max_seq_len=20):
+                 max_len_pe=1000):
         
         super(AttentionModel, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.n_encode_layers = n_encode_layers
+        self.n_decode_layers = n_decode_layers
         self.decode_type = None
         self.beam_width = beam_width
         self.temp = 1.0
@@ -501,7 +621,7 @@ class AttentionModel(nn.Module):
         self.mask_inner = mask_inner
         self.mask_logits = mask_logits
         self.n_heads = n_heads
-        step_context_dim = 4 * embedding_dim  # Embedding of first and last node
+        # step_context_dim = 4 * embedding_dim  # Embedding of first and last node
         # node_dim = 100
         node_dim = 2
         self.W_placeholder = nn.Parameter(torch.Tensor(4 * embedding_dim))
@@ -519,51 +639,48 @@ class AttentionModel(nn.Module):
         )
         # 看论文，这些都是与论文息息相关的
         # For each node we compute (glimpse key, glimpse value, logit key) so 3 * embedding_dim
-        self.project_node_embeddings = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
-        self.project_fixed_context = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        self.project_step_context = nn.Linear(step_context_dim, embedding_dim, bias=False)
+        # self.project_node_embeddings = nn.Linear(embedding_dim, 3 * embedding_dim, bias=False)
+        # self.project_fixed_context = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        # self.project_step_context = nn.Linear(step_context_dim, embedding_dim, bias=False)
         # self.embed_static_traffic = nn.Linear(node_dim * max_t, embedding_dim)
-        self.embed_static_traffic = nn.Linear(input_size, embedding_dim)
-        self.embed_static = nn.Linear(2 * embedding_dim, embedding_dim)
+        # self.embed_static_traffic = nn.Linear(input_size, embedding_dim)
+        # self.embed_static = nn.Linear(2 * embedding_dim, embedding_dim)
+        self.PE = generate_positional_encoding(embedding_dim, max_len_pe)
         assert embedding_dim % n_heads == 0
+        self.start_placeholder = nn.Parameter(torch.randn(embedding_dim))
+
+        # decoder layer
+        self.decoder = GraphAttentionDecoder(embedding_dim, n_heads, self.n_decode_layers)
+        self.WK_att_decoder = nn.Linear(embedding_dim, self.n_decode_layers * embedding_dim)
+        self.WV_att_decoder = nn.Linear(embedding_dim, self.n_decode_layers * embedding_dim)
+        self.PE = generate_positional_encoding(embedding_dim, max_len_pe).to(device)
         # Note n_heads * val_dim == embedding_dim so input to project_out is embedding_dim
-        self.project_out = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        self.project_traffic = nn.Linear(input_size*input_size, embedding_dim, bias=False)
-        self.project_visit = nn.Linear(input_size, embedding_dim, bias=False)
-        # self.xx = torch.tensor([[i for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
-        # self.yy = torch.tensor([[j for j in range(input_size)] for i in range(input_size)], device=device).view(1, input_size, input_size)
-        self.xx = torch.range(0, input_size - 1, dtype=torch.int64, device=device).view(1, input_size)
-        self.yy = torch.range(0, input_size - 1, dtype=torch.int64, device=device).view(1, input_size)
-        # xx，yy都是三维的
-        # print(self.xx.ndim)
-        # print(self.yy.ndim)
+        # self.project_out = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        # self.project_traffic = nn.Linear(input_size*input_size, embedding_dim, bias=False)
+        # self.project_visit = nn.Linear(input_size, embedding_dim, bias=False)
     def set_decode_type(self, decode_type, temp=None):
         self.decode_type = decode_type
         if temp is not None:  # Do not change temperature if not provided
             self.temp = temp
     
-    def forward(self, input, return_pi=False):
+    def forward(self, input):
         """
         :param input: (batch_size, graph_size, node_dim) input node features or dictionary with multiple tensors
         :param return_pi: whether to return the output sequences, this is optional as it is not compatible with
         using DataParallel as the results may be of different lengths on different GPUs
         :return:
         """
-        # Linear层 in: 100 out: 128 bias: True
+        batch_size, node_size = input.size(0), input.size(1)
         x = self._init_embed(input) # 将每个客户节点i转换为ID嵌入x_i
-        # z = mat.mat.reshape(1, 100, 1200).repeat(input.size(0), 1, 1) # 将100个节点不同时间段的距离（时间距离）扩展为input的batch_size，方便使用
-        # _, ind = torch.max(input, dim=2) 注释掉是因为修改数据集后，input本身就是城市坐标了
-        mat = DistanceMatrix(input)
-        # z = mat.cities_distance.reshape(1, 100, 100).repeat(input.size(0), 1, 1)
-        # tr = z.gather(1, ind.view(input.size(0), -1, 1).expand(input.size(0), input.size(1), 100)) # 应该是获取当前批次要访问的节点在各个时间的时间距离
-        y = self.embed_static_traffic(mat.cities_distance) # 将估计的流量状况(mat)转化为流量嵌入y_i  # TODO 论文指出在DPDP数据集中还嵌入了运输量q，但我还没发现相关代码
+        # mat = DistanceMatrix(input)
+        # y = self.embed_static_traffic(mat.cities_distance) # 将估计的流量状况(mat)转化为流量嵌入y_i  # TODO 论文指出在DPDP数据集中还嵌入了运输量q，但我还没发现相关代码
         # 编码器执行，输出每个节点的特以及整个图
-        embeddings, _ = self.embedder(self.embed_static(torch.cat((x, y), dim = 2))) # 将x和y连接起来，产生{h^(0)_0},并且作为图注意力编码器的前向传播的输入
-        # embeddings, _ = self.embedder(x)
-        self.embeddings = embeddings # embeddings为h_i, embedder前向传播返回值中的h_i的平均值被忽略
+        # embeddings, _ = self.embedder(self.embed_static(torch.cat((x, y), dim = 2))) # 将x和y连接起来，产生{h^(0)_0},并且作为图注意力编码器的前向传播的输入
+        # 此处embeddings应该为(bsz, nb_nodes+1, dim_emb)
+        embeddings, _ = self.embedder(torch.cat([x, self.start_placeholder.repeat(batch_size, 1, 1)], dim=1))
         # 解码器运行，log_p就是论文中解码器的输出p(每一个下一步的所有可能的概率)， pi是访问序列，state是论文中Fig.1中的state
-        _log_p, pi, state = self._inner(input, embeddings, mat)
-        cost, mask = get_costs(input, pi, state, mat)
+        _log_p, pi = self._inner(input, embeddings)
+        cost, mask = get_costs(input, pi)
         # Log likelyhood is calculated within the model since returning it per action does not work well with
         # DataParallel since sequences can be of different lengths
         ll = self._calc_log_likelihood(_log_p, pi, mask)
@@ -642,7 +759,7 @@ class AttentionModel(nn.Module):
                 beam_states[0][0].state)
 
     # 解码器相关函数
-    def _inner(self, input, embeddings, mat):
+    def _inner(self, input, embeddings):
         """
         :param input: 客户的访问状态
         :param mat: 当前交通状况（距离）
@@ -652,27 +769,33 @@ class AttentionModel(nn.Module):
         """
         outputs = []
         sequences = []
-        state = StateTSP.initialize(input)
-        # state = state.addmask()   # TSP问题不一定从0点开始
-        # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
-        # Perform decoding steps 执行解码步骤
-        fixed = self._precompute(embeddings)
-        # 论文中讲的多次解码，就是通过这个while循环中实现的
-        while not (state.all_finished()): # 访问完20个节点则while结束，这个20是由opt.graph_size控制
-            # 获取20个节点的选择概率，以及掩码（visited）
-            log_p, mask = self._get_log_p(fixed, state, mat, input)     # self-attention feed_back mask
+        batch_size, node_size = input.size(0), input.size(1)
+        zero_to_bsz = torch.arange(batch_size, device=device)
 
-            # Select the indices of the next nodes in the sequences, result (batch_size) long
-            selected = self._select_node(log_p.exp()[:, 0, :], mask[:, 0, :])  # Squeeze out steps dimension
-            # 一次性选择为每个(1, 20)的tensor选择出一个节点, 并且update后，mask中对应的该节点会为True
-            state = state.update(selected, mat, input) # state.lengths在此处进行修改
+        # fixed = self._precompute(embeddings)
+        k_att = self.WK_att_decoder(embeddings)
+        v_att = self.WV_att_decoder(embeddings)
+        idx_start_placeholder = (torch.Tensor([node_size]).long()
+                                 .repeat(batch_size).to(device))
+        h_start = embeddings[zero_to_bsz, idx_start_placeholder, :] + self.PE[0].repeat(batch_size, 1)
 
-            # Collect output of step
+        mask = torch.zeros((batch_size, node_size + 1), device=device).bool()
+        mask[zero_to_bsz, node_size] = True
+        self.decoder.reset_self_att_keys_values()
+        h_t = h_start
+        for i in range(node_size):
+            probs = self.decoder(h_t, k_att, v_att, mask)
+            selected = self._select_node(probs, mask)
+            log_p = torch.log(probs[zero_to_bsz, :]).view(batch_size, 1, -1)
             outputs.append(log_p[:, 0, :])
-            sequences.append(selected) # TODO 保存sequence结果
+            sequences.append(selected)
+            h_t = embeddings[zero_to_bsz, selected, :]
+            h_t = h_t + self.PE[i + 1].expand(batch_size, self.embedding_dim)
+            mask = mask.clone()
+            mask[zero_to_bsz, selected] = True
+
         # Collected lists, return Tensor
-        # TODO 描述数据，打印出sequences，然后描述数据变化。 把程序执行顺序记下来
-        return torch.stack(outputs, 1), torch.stack(sequences, 1), state
+        return torch.stack(outputs, 1), torch.stack(sequences, 1)
 
 
         # if self.decode_type == "greedy":
