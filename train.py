@@ -416,6 +416,7 @@ def run(opts):
         # 只评估
         validate(model, val_dataset, opts)
     else:
+        torch.autograd.set_detect_anomaly(True)
         for epoch in range(opts.epoch_start, opts.epoch_start + opts.n_epochs):
             # 模型训练方法
             train_epoch(

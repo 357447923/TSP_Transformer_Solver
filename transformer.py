@@ -679,11 +679,12 @@ class AttentionModel(nn.Module):
         # 此处embeddings应该为(bsz, nb_nodes+1, dim_emb)
         embeddings, _ = self.embedder(torch.cat([x, self.start_placeholder.repeat(batch_size, 1, 1)], dim=1))
         # 解码器运行，log_p就是论文中解码器的输出p(每一个下一步的所有可能的概率)， pi是访问序列，state是论文中Fig.1中的state
-        _log_p, pi = self._inner(input, embeddings)
+        probs_of_choices, pi = self._inner(input, embeddings)
         cost, mask = get_costs(input, pi)
         # Log likelyhood is calculated within the model since returning it per action does not work well with
         # DataParallel since sequences can be of different lengths
-        ll = self._calc_log_likelihood(_log_p, pi, mask)
+        ll = probs_of_choices.sum(dim=1)
+        # ll = self._calc_log_likelihood(_log_p, pi, mask)
         return cost, ll, pi
 
     def _init_embed(self, x):
@@ -725,38 +726,57 @@ class AttentionModel(nn.Module):
             sequences.append(selected)  # TODO 保存sequence结果
         return torch.stack(outputs, 1), torch.stack(sequences, 1), state
 
-    def _beam_search(self, input, fixed, mat, state, beam_width = 2):
+    def _beam_search(self, input, embeddings, beam_width = 2):
         class BeamState:
-            def __init__(self, init_state, init_seq, init_outputs):
-                self.state = init_state
+            def __init__(self, init_mask, init_h_t, init_seq, init_outputs):
+                self.mask = init_mask
+                self.h_t = init_h_t
                 self.sequences = init_seq
                 self.outputs = init_outputs
-        beam_states = [(BeamState(state, [], []), 0.0)] # (BeamState, score 概率和) 用于剪枝
-        while not beam_states[0][0].state.all_finished():
-            new_beam_states = []
-            for i in range(len(beam_states)):
-                    beam_state = beam_states[i][0]
 
-                    log_p, mask = self._get_log_p(fixed, beam_state.state, mat, input)
-                    topk_probs, topk_nodes = torch.topk(log_p[:, 0, :], beam_width)
-                    for j in range(beam_width):
-                        sequences = beam_state.sequences  + [topk_nodes[:, j]]
-                        outputs = beam_state.outputs + [log_p[:, 0, :]]
-                        init_state = beam_state.state.update(topk_nodes[:, j], mat, input)
-                        probs = topk_probs[:,  j]
+        batch_size, node_size = input.size(0), input.size(1)
+        zero_to_bsz = torch.arange(batch_size, device=device)
+
+        k_att = self.WK_att_decoder(embeddings)
+        v_att = self.WV_att_decoder(embeddings)
+        idx_start_placeholder = torch.Tensor([node_size]).long().repeat(batch_size).to(device)
+        h_start = embeddings[zero_to_bsz, idx_start_placeholder, :] + self.PE[0].repeat(batch_size, 1)
+
+        mask = torch.zeros((batch_size, node_size + 1), device=device).bool()
+        mask[zero_to_bsz, node_size] = True
+        beam_states = [(BeamState(mask, h_start, [], []), 0.0)]  # (BeamState, score 概率和) 用于剪枝
+        self.decoder.reset_self_att_keys_values()
+        for i in range(node_size):
+            new_beam_states = []
+            for j in range(len(beam_states)):
+                    beam_state = beam_states[j][0]
+
+                    # log_p, mask = self._get_log_p(fixed, beam_state.state, mat, input)
+                    probs = self.decoder(beam_state.h_t, k_att, v_att, beam_state.mask)
+                    topk_probs, topk_nodes = torch.topk(probs, beam_width)
+                    for k in range(beam_width):
+                        # init_state = beam_state.state.update(topk_nodes[:, k], mat, input)
+                        probs = torch.log(topk_probs[:,  k])
+                        selected = topk_nodes[:, k]
                         if torch.isinf(probs).all():
                             break
+                        sequences = beam_state.sequences + [selected]
+                        outputs = beam_state.outputs + [probs]
                         msk = ~torch.isinf(probs)
-                        new_beam_states.append((BeamState(init_state, sequences, outputs),
-                                            beam_states[i][1] + torch.mean(probs[msk]).item()))
+                        h_t = embeddings[zero_to_bsz, selected, :] + self.PE[i + 1].expand(batch_size, self.embedding_dim)
+                        mask = beam_state.mask.clone()
+                        mask[zero_to_bsz, selected] = True
+                        new_beam_states.append((BeamState(mask, h_t, sequences, outputs),
+                                            beam_states[j][1] + torch.mean(probs[msk]).item()))
 
             # 剪枝，取最大的几个
             new_beam_states = heapq.nlargest(beam_width, new_beam_states, key=lambda x: x[1])
             beam_states = new_beam_states
-
+        # 保证确实是访问完了20个节点
+        assert torch.sum(beam_states[0][0].mask).item() == (node_size + 1) * batch_size
+        # 返回整体概率最大的一项
         return (torch.stack(beam_states[0][0].outputs, 1),
-                torch.stack(beam_states[0][0].sequences, 1),
-                beam_states[0][0].state)
+                torch.stack(beam_states[0][0].sequences, 1))
 
     # 解码器相关函数
     def _inner(self, input, embeddings):
@@ -767,12 +787,13 @@ class AttentionModel(nn.Module):
         :output output: p0, ..., pc
         :output sequences: 节点访问选择顺序
         """
+        if self.decode_type == "beam_search":
+            return self._beam_search(input, embeddings, self.beam_width)
         outputs = []
         sequences = []
         batch_size, node_size = input.size(0), input.size(1)
         zero_to_bsz = torch.arange(batch_size, device=device)
 
-        # fixed = self._precompute(embeddings)
         k_att = self.WK_att_decoder(embeddings)
         v_att = self.WV_att_decoder(embeddings)
         idx_start_placeholder = (torch.Tensor([node_size]).long()
@@ -786,8 +807,7 @@ class AttentionModel(nn.Module):
         for i in range(node_size):
             probs = self.decoder(h_t, k_att, v_att, mask)
             selected = self._select_node(probs, mask)
-            log_p = torch.log(probs[zero_to_bsz, :]).view(batch_size, 1, -1)
-            outputs.append(log_p[:, 0, :])
+            outputs.append(torch.log(probs[zero_to_bsz, selected]))
             sequences.append(selected)
             h_t = embeddings[zero_to_bsz, selected, :]
             h_t = h_t + self.PE[i + 1].expand(batch_size, self.embedding_dim)
