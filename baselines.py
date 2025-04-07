@@ -17,26 +17,6 @@ class TSPDataset(Dataset):
     def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
         super(TSPDataset, self).__init__()
 
-        # self.data_set = []
-        # l = torch.rand((num_samples, ci.n_cities - 1), device=device)
-        # _, ind = torch.sort(l)
-        # ind = ind.to(device)
-        # ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
-        # ind = ind[:,:size,:] + 1
-        # ff = ci.cities.unsqueeze(0)
-        # ff = ff.expand(num_samples, ci.n_cities, 2)
-        # f = torch.gather(ff, dim = 1, index = ind)
-        # f = f.permute(0,2,1)
-        # depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1)
-        # self.static = torch.cat((depot, f), dim = 2)
-        # depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
-        # ind = ind[:,:,0:1]
-        # ind = torch.cat((depot, ind), dim=1)
-        #
-        # self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
-        #
-        # self.data = self.data.scatter_(2, ind, 1.)
-        # self.size = len(self.data)
         data = [torch.FloatTensor(size, 2).uniform_(0, 1) for _ in range(num_samples)]
         self.data = torch.stack(data, dim=0).to(device)
 
@@ -217,7 +197,7 @@ class RolloutBaseline(Baseline):
     def _update_model(self, model, epoch, dataset=None):
         self.model = copy.deepcopy(model)
         # Always generate baseline dataset when updating model to prevent overfitting to the baseline dataset
-
+        # 这一步的目的是能够让模型训练中断后继续训练时用回原本的基线（包括数据集）
         if dataset is not None:
             if len(dataset) != self.opts.val_size:
                 print("Warning: not using saved baseline dataset since val_size does not match")
@@ -238,7 +218,7 @@ class RolloutBaseline(Baseline):
 
     def _reload_model(self, model):
         # model = copy.deepcopy(self.model)
-        # 我替换成以下代码, 源代码的reload应该是有问题的
+        # 我替换成以下代码, 源代码的reload应该是有问题的（没有验证过）
         model.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
 
@@ -285,7 +265,7 @@ class RolloutBaseline(Baseline):
              end if
         """
         if candidate_mean - self.mean < 0: # 平均值小，意味着total_travel_time小(reward大), DRL最重要的就是尽可能使reward大
-            # Calc p value
+            # Calc p value 单侧T检验
             t, p = ttest_rel(candidate_vals, self.bl_vals)
             p_val = p / 2  # one-sided
             assert t < 0, "T-statistic should be negative"
@@ -294,10 +274,7 @@ class RolloutBaseline(Baseline):
             if p_val < self.opts.bl_alpha:
                 print('Update baseline')
                 self._update_model(model, epoch) # TODO 文档标注此处为θ*更新完毕
-        elif epoch - self.epoch > 99 and epoch - self.last > 99:
-            print("reload")
-            self._reload_model(model)
-            self.last = epoch
+
     def state_dict(self):
         return {
             'model': self.model,

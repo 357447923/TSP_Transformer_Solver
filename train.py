@@ -6,6 +6,8 @@ from torch.utils.data import Dataset
 import json
 from torch.utils.data import DataLoader
 import numpy as np
+from tqdm import tqdm
+
 from transformer import AttentionModel
 from scipy.interpolate import CubicSpline
 
@@ -21,32 +23,6 @@ warnings = warnings.filterwarnings("ignore")
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-class Cities:
-    def __init__(self, n_cities=100, load_dir=None):
-        def read_tsp_coordinates(file_name):
-            coordinates = []
-            with open(file_name, 'r') as f:
-                read_data = False
-                for line in f:
-                    line = line.strip()
-                    if line == "NODE_COORD_SECTION":
-                        read_data = True
-                        continue
-                    if line == "EOF":
-                        break
-                    if read_data:
-                        parts = line.split()
-                        x, y = float(parts[1]), float(parts[2])
-                        coordinates.append((x, y))
-            return np.array(coordinates)
-        self.n_cities = n_cities
-        if load_dir is None:
-            self.cities = torch.rand((n_cities, 2), device=device) * 1.
-        else:
-            self.cities = torch.from_numpy(read_tsp_coordinates(load_dir))
-    def __getdis__(self,i, j):
-        return torch.sqrt(torch.sum(torch.pow(torch.sub(self.cities[i], self.cities[j]), 2)))
 
 # rollout 和 roll分别用于执行模型的评估过程，遍历数据集并在贪心解码模式下计算每批数据的成本
 def rollout(model, dataset, opts):
@@ -115,28 +91,10 @@ def log_values(cost, grad_norms, epoch, batch_id, step,
 
 
 class TSPDataset(Dataset):
-    # AI: 构建出了包含城市坐标信息、访问顺序等相关数据的数据集对象
+    # 构建出了包含城市坐标信息、访问顺序等相关数据的数据集对象
     def __init__(self, filename=None, size=50, num_samples=1000000, offset=0, distribution=None):
         super(TSPDataset, self).__init__()
 
-        # self.data_set = []
-        # l = torch.rand((num_samples, ci.n_cities - 1)) # 随机生成城市坐标
-        # _, ind = torch.sort(l)
-        # ind = ind.to(device)
-        # ind = ind.unsqueeze(2).expand(num_samples, ci.n_cities - 1, 2)
-        # ind = ind[:,:size,:] + 1
-        # ff = ci.cities.unsqueeze(0)
-        # ff = ff.expand(num_samples, ci.n_cities, 2) # 此时ff中有num_samples个城市坐标(ci.cities)
-        # f = torch.gather(ff, dim = 1, index = ind)
-        # f = f.permute(0,2,1) # 把形状(1000, 19, 2) 调为 (1000,2,19)
-        # depot = ci.cities[0].view(1, 2, 1).expand(num_samples, 2, 1) # 看到这块，我感觉应该得结合论文的第四部分的Part A看
-        # self.static = torch.cat((depot, f), dim = 2)
-        # depot = torch.zeros(num_samples, 1, 1, dtype=torch.long, device=device)
-        # ind = ind[:,:,0:1]
-        # ind = torch.cat((depot, ind), dim=1)
-        # self.data = torch.zeros(num_samples, size+1, ci.n_cities, device=device)
-        # self.data = self.data.scatter_(2, ind, 1.)
-        # self.size = len(self.data)
         data = [torch.FloatTensor(size, 2).uniform_(0, 1) for _ in range(num_samples)]
         self.data = torch.stack(data, dim=0).to(device)
 
@@ -146,7 +104,6 @@ class TSPDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
-        # return self.data[idx], self.quality[idx]
         return self.data[idx]
 
 
@@ -208,8 +165,8 @@ def train_batch(
     loss = reinforce_loss + bl_loss
 
     # Perform backward pass and optimization step
-    # 做梯度下降
-    optimizer.zero_grad()   # 清除梯度
+    # 做梯度下降更新参数
+    optimizer.zero_grad()
     loss.backward() # 反向传播
     # Clip gradient norms and get (clipped) gradient norms for logging
     grad_norms = clip_grad_norms(optimizer.param_groups, opts.max_grad_norm)
@@ -236,8 +193,8 @@ def train_epoch(model, optimizer, baseline, lr_scheduler, epoch, val_dataset, tb
 
     # Put model in train mode!
     model.train()
-    set_decode_type(model, "sampling") # train为sampling解码， validate为greedy解码
-    # 一批有512个， 一共有250批
+    set_decode_type(model, "sampling") # train为sampling解码，validate为greedy解码
+    # 一批有512个， 一共有2500批
     for batch_id, batch in enumerate(training_dataloader):
         # 处理每个批次的训练
         train_batch(
@@ -274,7 +231,7 @@ def train_epoch(model, optimizer, baseline, lr_scheduler, epoch, val_dataset, tb
 
     if not opts.no_tensorboard:
         tb_logger.log_value('val_avg_reward', avg_reward, step)
-
+    # 重点关注RolloutBaseline
     baseline.epoch_callback(model, epoch)
 
 
@@ -316,18 +273,6 @@ def run(opts):
     if load_path is not None:
         print('  [*] Loading data from {}'.format(load_path))
         load_data = torch_load_cpu(load_path)
-    # 初始化距离向量，城市默认100个节点
-    # ci = Cities()
-    # mat包含了ci，这一步之后，才把data.csv数据读入，并且分为12个时间段
-    # 并且在该模型中，距离是用时间来进行评估的，生成距离向量中采用三次样条插值
-    # 的目的在于得到估计的旅行时间函数f_i_j(t)
-    # mat = DistanceMatrix(ci, load_dir='./data.csv', max_time_step = 12)
-    # mat = DistanceMatrix(ci)
-    # np.savetxt('var.txt', mat.var.cpu().numpy(), fmt='%.6f')
-    # np.savetxt('mat.txt', mat.mat.cpu().numpy(), fmt='%.6f')
-    # np.savetxt('m2.txt', mat.m2.cpu().numpy(), fmt='%.6f')
-    # np.savetxt('m3.txt', mat.m3.cpu().numpy(), fmt='%.6f')
-    # np.savetxt('m4.txt', mat.m4.cpu().numpy(), fmt='%.6f')
     # Initialize model
     # 选择注意力模型类
     model_class = AttentionModel
@@ -357,7 +302,6 @@ def run(opts):
         baseline = ExponentialBaseline(opts.exp_beta) #指数基线
     
     elif opts.baseline == 'rollout':
-        # baseline = RolloutBaseline(mat, ci, model, opts) # Rollout基线，Rollout貌似都是使用greedy策略
         baseline = RolloutBaseline(model, opts)
     else:
         assert opts.baseline is None, "Unknown baseline: {}".format(opts.baseline)

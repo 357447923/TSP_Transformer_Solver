@@ -4,13 +4,11 @@ import time
 import torch
 import math
 
-from torch.onnx.symbolic_opset9 import tensor
 from torch.utils.data import Dataset
 import json
 from torch.utils.data import DataLoader
 import numpy as np
 from transformer import AttentionModel
-from scipy.interpolate import CubicSpline
 
 import torch.optim as optim
 from tensorboard_logger import Logger as TbLogger
@@ -24,57 +22,7 @@ warnings = warnings.filterwarnings("ignore")
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-class Cities:
-    def __init__(self, n_cities=100, load_dir=None):
-        def read_tsp_coordinates(file_name):
-            coordinates = []
-            with open(file_name, 'r') as f:
-                read_data = False
-                for line in f:
-                    line = line.strip()
-                    if line == "NODE_COORD_SECTION":
-                        read_data = True
-                        continue
-                    if line == "EOF":
-                        break
-                    if read_data:
-                        parts = line.split()
-                        x, y = float(parts[1]), float(parts[2])
-                        coordinates.append((x, y))
-            return np.array(coordinates)
-        self.n_cities = n_cities
-        if load_dir is None:
-            self.cities = torch.rand((n_cities, 2), device=device) * 1.
-        else:
-            self.cities = torch.from_numpy(read_tsp_coordinates(load_dir)).to(device).type(torch.float32)
-    def __getdis__(self,i, j):
-        return torch.sqrt(torch.sum(torch.pow(torch.sub(self.cities[i], self.cities[j]), 2)))
 
-class DistanceMatrix:
-    # DistanceMatrix类用于模拟城市间，并实现基于时间变化的距离矩阵
-    # def __init__(self, ci, max_time_step = 100, load_dir = None):
-    def __init__(self, ci):
-        self.cities = ci
-
-    # 与getddd 都用于获取在某一特定时间t下，由状态向量st中指定的城市a和b的距离估计
-    # 但getd针对单个时间点和一对城市计算距离，而getddd是批量处理计算
-    def __getd__(self, st, a, b):
-        # a = torch.gather(st, 1, a)
-        # b = torch.gather(st, 1, b)
-        cities = self.cities.repeat(st.size(0), 1, 1)
-        city_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
-        city_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
-        res = torch.cdist(city_a, city_b) # 计算二维欧氏距离
-        return res
-    def __getddd__(self, st, a, b):
-        s0, s1 = a.size(0), a.size(1) * b.size(1)
-        a = torch.gather(st, 1, a)
-        b = torch.gather(st, 1, b)
-        cities = self.cities.repeat(st.size(0), 1, 1).to(st.device)
-        cities_a = torch.gather(cities, 1, a.unsqueeze(-1).expand(-1, -1, 2))
-        cities_b = torch.gather(cities, 1, b.unsqueeze(-1).expand(-1, -1, 2))
-        res = torch.cdist(cities_a, cities_b)
-        return res.view(s0, s1)
 def rollout(model, dataset, opts):
     # Put in greedy evaluation mode!
     set_decode_type(model, "greedy")
@@ -91,17 +39,23 @@ def rollout(model, dataset, opts):
     ], 0)
 def roll(model, dataset, opts):
     # Put in greedy evaluation mode!
-    set_decode_type(model, "beam_search")
+    assert opts.decode_type == "beam_search" or opts.decode_type == "greedy", "Unknown decode type: {}".format(opts.decode_type)
+    set_decode_type(model, opts.decode_type)
     model.eval()
     c = []
     p = []
+    step = 0
+    max_step = dataset.size // opts.eval_batch_size
+    if dataset.size % opts.eval_batch_size != 0:
+        max_step += 1
     def eval_model_bat(bat):
         with torch.no_grad():
             cost, _, pi = model(move_to(bat, opts.device))
         return cost.data.cpu(), pi.data.cpu()
-    
     for bat in DataLoader(dataset, batch_size=opts.eval_batch_size):
+        print(f"正在处理第{step + 1}批, 共{max_step}批")
         cost, pi = eval_model_bat(bat)
+        step += 1
         for z in range(cost.size(0)):
             c.append(cost[z])
             p.append(pi[z])
@@ -389,8 +343,7 @@ def run(opts):
     # Initialize learning rate scheduler, decay by lr_decay once per epoch!
     lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: opts.lr_decay ** epoch)
     # Start the actual training loop
-    #val_dataset = TSPDataset(ci, size=opts.graph_size, num_samples=opts.val_size, distribution=opts.data_distribution)
-    val_dataset = TSPDataset(size=opts.graph_size, num_samples=10000, filename='./data/tsp/tsp20_test_seed1234.pkl', distribution=opts.data_distribution)
+    val_dataset = TSPDataset(size=opts.graph_size, num_samples=1000, filename='./data/tsp/tsp20_test_seed1234.pkl', distribution=opts.data_distribution)
     _,ind = torch.max(val_dataset.data, dim=2)
     #np.savetxt('valid_data.txt', ind.numpy(), fmt='%d')
     if opts.resume:

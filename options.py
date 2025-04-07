@@ -12,7 +12,7 @@ def get_options(args=None):
     parser.add_argument('--problem', default='tsp', help="The problem to solve, default 'tsp'")
     parser.add_argument('--graph_size', type=int, default=20, help="The size of the problem graph")
     parser.add_argument('--batch_size', type=int, default=512, help='Number of instances per batch during training')
-    parser.add_argument('--epoch_size', type=int, default=1280000, help='Number of instances per epoch during training')
+    parser.add_argument('--epoch_size', type=int, default=128000, help='Number of instances per epoch during training')
     parser.add_argument('--val_size', type=int, default=1000,
                         help='Number of instances used for reporting validation performance')
     parser.add_argument('--val_dataset', type=str, default=None, help='Dataset file to use for validation')
@@ -31,6 +31,8 @@ def get_options(args=None):
     parser.add_argument('--normalization', default='batch', help="Normalization type, 'batch' (default) or 'instance'")
     parser.add_argument("--beam_width", type=int, default=2,
                         help='Number of beam_width in greedy decode type')
+    parser.add_argument("--decode_type", default="greedy"
+                        , help="It is only used at test, 'greedy'(default) or 'beam_search'")
 
     # Training
     parser.add_argument('--lr_model', type=float, default=1e-4, help="Set the learning rate for the actor network")
