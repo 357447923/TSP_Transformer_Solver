@@ -305,7 +305,7 @@ class AutoRegressiveDecoderLayer(nn.Module):
         self.K_sa = None
         self.V_sa = None
 
-    # For beam search
+    # 用于BeamSearch解码策略
     def reorder_selfatt_keys_values(self, t, idx_top_beams):
         bsz, B = idx_top_beams.size()
         zero_to_B = torch.arange(B, device=idx_top_beams.device) # [0,1,...,B-1]
@@ -323,7 +323,7 @@ class AutoRegressiveDecoderLayer(nn.Module):
             self.V_sa[b, zero_to_B, :, :] = V_sa_tmp[b, idx_top_beams[b], :, :]
         self.V_sa = self.V_sa.view(bsz*B, t+1, self.dim_emb) # size(self.K_sa)=(bsz*B, t+1, dim_emb)
 
-    # For beam search
+    # 用于BeamSearch解码策略
     def repeat_selfatt_keys_values(self, B):
         self.K_sa = torch.repeat_interleave(self.K_sa, B, dim=0) # size(self.K_sa)=(bsz.B, t+1, dim_emb)
         self.V_sa = torch.repeat_interleave(self.V_sa, B, dim=0) # size(self.K_sa)=(bsz.B, t+1, dim_emb)
@@ -383,6 +383,7 @@ class GraphAttentionDecoder(nn.Module):
 
     def forward(self, h_t, K_att, V_att, mask):
         for l in range(self.n_decode_layers):
+            # 把K,V平均分为多份
             K_att_l = K_att[:, :,
                       l * self.embedding_dim:(l + 1) * self.embedding_dim].contiguous()  # size(K_att_l)=(bsz, nb_nodes+1, dim_emb)
             V_att_l = V_att[:, :,
@@ -398,14 +399,14 @@ class GraphAttentionDecoder(nn.Module):
         prob_next_node = attn_weights.squeeze(1)
         return prob_next_node
 
-def generate_positional_encoding(d_model, max_len):
+def generate_positional_encoding(d_model, max_len=1000):
     """
     Create standard transformer PEs.
     Inputs :
       d_model is a scalar correspoding to the hidden dimension
       max_len is the maximum length of the sequence
     Output :
-      pe of size (max_len, d_model), where d_model=dim_emb, max_len=1000
+      pe of size (max_len, d_model), where d_model=dim_emb, max_len
     """
     pe = torch.zeros(max_len, d_model).to(device)
     position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1).to(device)
@@ -521,7 +522,7 @@ class AttentionModel(nn.Module):
         v_att = self.WV_att_decoder(embeddings)
         k_att_tmp = k_att
         v_att_tmp = v_att
-        # 将旅行商问题视作为序列生成问题
+        # 将旅行商问题视作为序列生成问题，该序列一共有node_size个token
         for token in range(node_size):
             if token == 0:
                 b_t0 = min(self.beam_width, node_size) # 第一步最多有node_size个动作，即最多有node_size个候选路径
@@ -667,7 +668,7 @@ class AttentionModel(nn.Module):
         mask[zero_to_bsz, node_size] = True
         self.decoder.reset_self_att_keys_values()
         h_t = h_start
-        # 开始node_size次自回归解码
+        # 开始node_size次自回归解码，每次解码选择出下一个访问的城市
         for i in range(node_size):
             probs = self.decoder(h_t, k_att, v_att, mask)
             # 根据概率和解码策略进行动作选择
@@ -683,15 +684,6 @@ class AttentionModel(nn.Module):
 
         # Collected lists, return Tensor
         return torch.stack(outputs, 1), torch.stack(sequences, 1)
-
-    def _make_heads(self, v, num_steps=None):
-        assert num_steps is None or v.size(1) == 1 or v.size(1) == num_steps
-
-        return (
-            v.contiguous().view(v.size(0), v.size(1), v.size(2), self.n_heads, -1)
-            .expand(v.size(0), v.size(1) if num_steps is None else num_steps, v.size(2), self.n_heads, -1)
-            .permute(3, 0, 1, 2, 4)  # (n_heads, batch_size, num_steps, graph_size, head_dim)
-        )
 
     def _select_node(self, probs, mask):
 
