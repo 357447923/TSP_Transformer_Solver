@@ -22,13 +22,13 @@ python train.py --baseline rollout --graph_size 20
 测试该模型的性能可以在控制台输入：
 
 ```
-python test.py --baseline rollout --graph_size 20 --load_path trained_model/tsp20/epoch_99.pt
+python test.py --baseline rollout --graph_size 20 --load_path trained_model/TSP20/epoch_99.pt
 ```
 
 若想要使用beam search进行测试，则输入：
 
 ```
-python test.py --baseline rollout --graph_size 20 --decode_type beam_search --beam_width 5 --load_path trained_models/m1/epoch_99.pt
+python test.py --baseline rollout --graph_size 20 --decode_type beam_search --beam_width 5 --load_path trained_model/TSP20/epoch_99.pt
 ```
 
 
